@@ -45,11 +45,14 @@ pub fn render_svg(
 ) -> String {
     let mut labels = String::new();
     // Place points are duplicated into every tile whose buffer covers them, so
-    // the same label would otherwise be drawn once per tile (a few pixels
+    // the same label would otherwise be collected once per tile (a few pixels
     // apart, appearing as doubled/bold text). Deduplicate by name *and* a coarse
     // output-space grid cell, so cross-tile copies collapse without suppressing
     // genuinely distinct places that happen to share a name.
     let mut seen_labels: HashSet<(String, i64, i64)> = HashSet::new();
+    // Candidate labels are collected first, then placed after all tiles are
+    // processed so we can declutter (drop overlapping ones) by priority.
+    let mut label_candidates: Vec<LabelCandidate> = Vec::new();
 
     // Render layer-major (painter's algorithm) across *all* tiles: everything
     // is drawn into a per-z-level bucket, then the buckets are concatenated
@@ -69,7 +72,13 @@ pub fn render_svg(
             let bucket = &mut levels[style.z as usize];
 
             let scale = 256.0 / layer.extent as f64;
-            let is_label_layer = layer.name.to_lowercase().contains("place");
+            // Layers that carry named features worth labeling: settlements
+            // (`places`), and water/physical features (oceans, seas, lakes,
+            // rivers). POIs are intentionally excluded to avoid clutter.
+            let labelable = {
+                let n = layer.name.to_lowercase();
+                n.contains("place") || n.contains("water") || n.contains("physical")
+            };
 
             // Colors can originate from user-supplied `style` overrides, so
             // escape them (once per layer) before they reach the SVG to avoid
@@ -78,19 +87,21 @@ pub fn render_svg(
             let stroke = style.stroke.as_deref().map(xml_escape);
 
             for feature in &layer.features {
-                if is_label_layer {
-                    if let Some((name, lx, ly, l)) =
-                        label_for_feature(feature, scale, offset_x, offset_y)
+                // Collect a label for named features (points, or lines labeled
+                // at their midpoint). This is in addition to drawing the
+                // geometry — a river is both stroked and labeled.
+                if labelable {
+                    if let Some(c) =
+                        label_for_feature(feature, viewport.zoom, scale, offset_x, offset_y)
                     {
                         // ~128px grid: near-identical positions (the same place
                         // seen from adjacent tiles) collapse; far-apart places
                         // with the same name do not.
-                        let cell = ((lx / 128.0).floor() as i64, (ly / 128.0).floor() as i64);
-                        if seen_labels.insert((name, cell.0, cell.1)) {
-                            labels.push_str(&l);
+                        let cell = ((c.x / 128.0).floor() as i64, (c.y / 128.0).floor() as i64);
+                        if seen_labels.insert((c.name.clone(), cell.0, cell.1)) {
+                            label_candidates.push(c);
                         }
                     }
-                    continue;
                 }
 
                 if let Some(path_d) = geometry_to_path(&feature.geometry, scale, offset_x, offset_y)
@@ -127,6 +138,27 @@ pub fn render_svg(
         }
     }
 
+    // Declutter labels: place the most important first (lowest priority value
+    // = highest rank), and skip any whose box overlaps an already-placed label.
+    // This is what keeps low zooms readable instead of a wall of overlapping
+    // town names.
+    label_candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)));
+    let mut placed: Vec<[f64; 4]> = Vec::new();
+    for c in &label_candidates {
+        // Rough text box: ~6.6px per char at font-size 12, plus vertical slack.
+        let half_w = (c.name.chars().count() as f64 * 3.3).max(6.0) + 2.0;
+        let half_h = 8.0;
+        let bx = [c.x - half_w, c.y - half_h, c.x + half_w, c.y + half_h];
+        let clashes = placed
+            .iter()
+            .any(|p| bx[0] < p[2] && bx[2] > p[0] && bx[1] < p[3] && bx[3] > p[1]);
+        if clashes {
+            continue;
+        }
+        placed.push(bx);
+        labels.push_str(&c.svg);
+    }
+
     let mut body = String::new();
     for level in &levels {
         body.push_str(level);
@@ -144,12 +176,30 @@ pub fn render_svg(
 
     body.push_str(&labels);
 
+    // Attribution in the bottom-right corner, with a white halo for legibility
+    // over any background. `&#169;` / `&#220;` are the XML numeric entities for
+    // the copyright sign and `Ü` (`&copy;` is HTML-only, invalid in SVG/XML).
+    let w = viewport.width;
+    let h = viewport.height;
+    let notice = format!("&#169; Kesk Systems O&#220; {}", current_year());
+    let attribution = format!(
+        "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"10\" font-family=\"sans-serif\" text-anchor=\"end\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"2.5\" paint-order=\"stroke\">{notice}</text>\n\
+         <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"10\" font-family=\"sans-serif\" text-anchor=\"end\" fill=\"#5f5f5f\">{notice}</text>\n",
+        x = w as f64 - 5.0,
+        y = h as f64 - 5.0,
+    );
+    body.push_str(&attribution);
+
     let background = PALETTE.background;
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{out_width}\" height=\"{out_height}\" viewBox=\"0 0 {w} {h}\">\n<rect width=\"{w}\" height=\"{h}\" fill=\"{background}\" />\n{body}</svg>",
-        w = viewport.width,
-        h = viewport.height,
     )
+}
+
+/// The current UTC year (Gregorian), for the attribution notice.
+fn current_year() -> i32 {
+    use chrono::Datelike;
+    chrono::Utc::now().year()
 }
 
 fn tp(x: f32, y: f32, scale: f64, ox: f64, oy: f64) -> (f64, f64) {
@@ -210,43 +260,106 @@ fn append_ring(d: &mut String, ring: &LineString<f32>, scale: f64, ox: f64, oy: 
     d.push_str("Z ");
 }
 
+/// A placed-or-not label with the data needed to declutter it.
+struct LabelCandidate {
+    name: String,
+    x: f64,
+    y: f64,
+    /// Lower is more important (from the tile's `sort_key`, else `-population`).
+    priority: i64,
+    svg: String,
+}
+
+/// Interprets a numeric MVT property value as `f64`, if it is numeric.
+fn value_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(f) => Some(*f as f64),
+        Value::Double(d) => Some(*d),
+        Value::Int(i) | Value::SInt(i) => Some(*i as f64),
+        Value::UInt(u) => Some(*u as f64),
+        _ => None,
+    }
+}
+
 /// Renders a point-layer feature's `name` property as a halo'd text label,
 /// if present. Returns the place name and its output-space position alongside
 /// the SVG so the caller can deduplicate labels that appear in more than one
-/// tile without collapsing distinct places that share a name. Only `Point`/
-/// `MultiPoint` geometries are supported; line and polygon labels (e.g. road
-/// names) are not placed.
+/// tile without collapsing distinct places that share a name.
+///
+/// Labels are filtered by the feature's `min_zoom` hint (present in Protomaps/
+/// OpenMapTiles `places`): a place is only labeled once the map has zoomed in
+/// far enough for it, so low zooms show only major places instead of every
+/// hamlet the (overzoomed) tile happens to contain. Points are labeled at their
+/// position and lines at their midpoint vertex (e.g. rivers); polygon labels are
+/// not placed.
 fn label_for_feature(
     feature: &mvt_reader::feature::Feature<f32>,
+    zoom: u8,
     scale: f64,
     ox: f64,
     oy: f64,
-) -> Option<(String, f64, f64, String)> {
-    let name = feature.properties.as_ref().and_then(|props| {
-        props
-            .get("name")
-            .or_else(|| props.get("name:en"))
-            .and_then(|v| match v {
-                Value::String(s) if !s.is_empty() => Some(s.clone()),
-                _ => None,
-            })
-    })?;
+) -> Option<LabelCandidate> {
+    let props = feature.properties.as_ref()?;
 
+    // Skip places whose minimum display zoom hasn't been reached yet.
+    if let Some(min_zoom) = props
+        .get("min_zoom")
+        .or_else(|| props.get("pmap:min_zoom"))
+        .and_then(value_as_f64)
+    {
+        if (zoom as f64) < min_zoom {
+            return None;
+        }
+    }
+
+    let name = props
+        .get("name")
+        .or_else(|| props.get("name:en"))
+        .and_then(|v| match v {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        })?;
+
+    // Anchor: a point's position, or the midpoint vertex of a line (so rivers
+    // etc. get a label roughly along their course).
+    let midpoint = |ls: &LineString<f32>| -> Option<(f64, f64)> {
+        let coords: Vec<_> = ls.coords().collect();
+        coords
+            .get(coords.len() / 2)
+            .map(|c| tp(c.x, c.y, scale, ox, oy))
+    };
     let (x, y) = match &feature.geometry {
         Geometry::Point(p) => tp(p.x(), p.y(), scale, ox, oy),
         Geometry::MultiPoint(mp) => {
             let p = mp.0.first()?;
             tp(p.x(), p.y(), scale, ox, oy)
         }
+        Geometry::LineString(ls) => midpoint(ls)?,
+        Geometry::MultiLineString(mls) => midpoint(mls.0.first()?)?,
         _ => return None,
     };
+
+    // Ranking for decluttering: the tile's `sort_key` (lower = more important)
+    // if present, else higher population wins (negated so lower = better).
+    let priority = props
+        .get("sort_key")
+        .and_then(value_as_f64)
+        .or_else(|| props.get("population").and_then(value_as_f64).map(|p| -p))
+        .map(|v| v as i64)
+        .unwrap_or(0);
 
     let escaped = xml_escape(&name);
     let svg = format!(
         "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"12\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"3\" paint-order=\"stroke\">{escaped}</text>\n\
          <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"12\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"#333333\">{escaped}</text>\n"
     );
-    Some((name, x, y, svg))
+    Some(LabelCandidate {
+        name,
+        x,
+        y,
+        priority,
+        svg,
+    })
 }
 
 fn render_marker_group(viewport: &Viewport, group: &MarkerGroup) -> String {

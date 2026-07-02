@@ -11,11 +11,7 @@ serde = { version = "1", features = ["derive"] }
 
 pmtiles = { version = "0.23", default-features = false, features = ["http-async", "mmap-async-tokio"] }
 bytes = "1"
-# pmtiles depends on reqwest with default-features disabled (no TLS backend).
-# Pulling reqwest in directly with its default features enables rustls so
-# HTTPS pmtiles URLs work; Cargo unifies this with pmtiles' reqwest dependency.
 reqwest = "0.13"
-
 mvt-reader = "2.4"
 geo-types = "0.7"
 geo = "0.33"
@@ -27,11 +23,7 @@ lyon = "1"
 resvg = "0.47"
 
 anyhow = "1"
-
-# Observability: structured logs + spans via `tracing`, exported to an
-# OpenTelemetry collector over OTLP/gRPC when `OTEL_EXPORTER_OTLP_ENDPOINT` is
-# set. Versions are pinned to the 0.30 line so the `opentelemetry` crate matches
-# the one re-exported by `poem`.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-opentelemetry = "0.31"
