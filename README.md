@@ -18,8 +18,8 @@ GET /staticmap?center=43.7715,11.2540&zoom=15&size=640x480
 
 - **PNG or SVG** output, at `scale` 1/2/4 for HiDPI.
 - **Seamless tiling.** Tiles are composited layer-major (painter's algorithm
-  across the whole scene) with a small per-tile "bleed", so there are no grey
-  seams where tiles meet.
+  across the whole scene) and each fill is sealed with a stroke of its own
+  color, so there are no grey seams where tiles meet.
 - **Google-Maps-style** default palette (land, water, parks, buildings, roads,
   railways, waterways, boundaries).
 - **Markers** with color, single-letter label, and size.
@@ -109,7 +109,7 @@ The source is organized as a handful of modules:
 - `geo_util.rs` — Web-Mercator projection and viewport/tile math.
 - `params.rs` — query-string parsing (markers, paths, styles, encoded polylines).
 - `style.rs` — the Google-Maps-like palette and per-layer styling.
-- `render.rs` — SVG assembly (layer-major compositing, tile bleed) and PNG rasterization.
+- `render.rs` — SVG assembly (layer-major compositing, fill sealing) and PNG rasterization.
 
 ### Why the tiles are seamless
 
@@ -117,5 +117,7 @@ Vector features are clipped per tile, and a naive tile-by-tile renderer draws
 each tile's full-tile background *after* its neighbor's foreground, so the
 background repaints over the seam — a visible grey line along every tile edge.
 `tiler` instead composites **layer-major across all tiles** (all `earth`, then
-all `landuse`, then buildings, …) and grows each tile's geometry outward by ~1px
-("bleed") so neighbors overlap. Together these remove the seams.
+all `landuse`, then buildings, …) so a background never lands on top of a
+neighbor's foreground, and seals each fill with a 1px stroke of its own color to
+cover the sub-pixel anti-aliasing gap where two fills meet. Together these
+remove the seams — without distorting feature geometry.

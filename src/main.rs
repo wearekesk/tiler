@@ -31,7 +31,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use poem::http::StatusCode;
 use poem::listener::TcpListener;
-use poem::middleware::Tracing;
+use poem::middleware::{CatchPanic, Tracing};
 use poem::{get, handler, EndpointExt, Request, Response, Route, Server};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -93,6 +93,10 @@ const CACHE_CONTROL: &str = "public, max-age=86400, s-maxage=604800, immutable";
 /// Upper bound on each *scaled* output dimension (px). Caps pixmap allocation
 /// so a large `size` x `scale` can't exhaust memory (8192x8192 RGBA ~= 256 MiB).
 const MAX_OUTPUT_DIM: u32 = 8192;
+
+/// Upper bound on the `zoom` parameter. The tile math shifts by `zoom`, so an
+/// unbounded value overflows and panics; no real tileset needs this many.
+const MAX_ZOOM: u8 = 24;
 
 /// Content ETag for a request. Folds in the query string, the resolved tile
 /// source, and the renderer version so a `304 Not Modified` can't serve stale
@@ -222,10 +226,18 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
 
     let center: Option<(f64, f64)> = qm.get_one("center").map(params::parse_latlon).transpose()?;
     let zoom: Option<u8> = match qm.get_one("zoom") {
-        Some(s) => Some(
-            s.parse()
-                .map_err(|e| bad_request(format!("invalid zoom: {e}")))?,
-        ),
+        Some(s) => {
+            let z: u8 = s
+                .parse()
+                .map_err(|e| bad_request(format!("invalid zoom: {e}")))?;
+            // Bound the zoom: the tile math shifts by `zoom`, so an unbounded
+            // value would overflow `1 << zoom` and panic (DoS). No real tileset
+            // goes anywhere near this.
+            if z > MAX_ZOOM {
+                return Err(bad_request(format!("zoom must be between 0 and {MAX_ZOOM}")));
+            }
+            Some(z)
+        }
         None => None,
     };
 
@@ -297,8 +309,8 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
             tiles.push(tile);
         }
     }
-    // Restore a deterministic order (JoinSet completes out of order) so the
-    // per-tile bleed overlap composites identically across requests.
+    // Restore a deterministic order (JoinSet completes out of order) so tiles
+    // composite identically across requests.
     tiles.sort_by_key(|((z, x, y), _)| (*z, *x, *y));
 
     let svg = render_svg(
@@ -346,8 +358,11 @@ async fn main() -> std::io::Result<()> {
     // Kept alive for the process lifetime so buffered spans keep flushing.
     let _telemetry = init_telemetry();
 
+    // `CatchPanic` (innermost) turns any handler panic into a 500 instead of
+    // killing the worker task; `Tracing` (outermost) still logs the response.
     let app = Route::new()
         .at("/staticmap", get(static_map))
+        .with(CatchPanic::new())
         .with(Tracing);
 
     let port: u16 = std::env::var("PORT")

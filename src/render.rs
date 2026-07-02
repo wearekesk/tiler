@@ -25,11 +25,6 @@ use crate::tiles::DecodedLayer;
 /// A single fetched-and-decoded XYZ tile, paired with its coordinate.
 pub type DecodedTile = ((u8, u32, u32), Vec<DecodedLayer>);
 
-/// How far, in output pixels, each tile's geometry is grown beyond its 256px
-/// square so neighboring tiles overlap and seams don't show. See the usage in
-/// [`render_svg`] for the full rationale.
-const TILE_BLEED_PX: f64 = 1.0;
-
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -65,29 +60,14 @@ pub fn render_svg(
 
     for ((_z, x, y), layers) in tiles {
         let (origin_x, origin_y) = viewport.tile_origin_px(*x, *y);
-        let tile_offset_x = origin_x - viewport.top_left_x;
-        let tile_offset_y = origin_y - viewport.top_left_y;
+        let offset_x = origin_x - viewport.top_left_x;
+        let offset_y = origin_y - viewport.top_left_y;
 
         for layer in layers {
             let style = style_for_layer(&layer.name, overrides);
             let bucket = &mut levels[style.z as usize];
 
-            // "Tile bleed": expand each tile's geometry outward from its own
-            // 256px square by `TILE_BLEED_PX` on every side, so adjacent tiles
-            // overlap by `2 * TILE_BLEED_PX` instead of merely butting up
-            // against each other. Vector features are clipped per tile and
-            // frequently stop a fraction of a pixel short of the tile edge;
-            // without overlap that leaves a hairline gap along every tile
-            // boundary. Growing the tile is an affine transform, so it folds
-            // cleanly into the scale and offset: shift the origin back by the
-            // bleed and scale up so the far edge extends the same amount past
-            // the boundary. Overlapping same-colored fills are invisible; where
-            // content differs, the later-drawn tile wins by ~1px, imperceptibly.
-            let base_scale = 256.0 / layer.extent as f64;
-            let bleed_factor = (256.0 + 2.0 * TILE_BLEED_PX) / 256.0;
-            let scale = base_scale * bleed_factor;
-            let offset_x = tile_offset_x - TILE_BLEED_PX;
-            let offset_y = tile_offset_y - TILE_BLEED_PX;
+            let scale = 256.0 / layer.extent as f64;
             let is_label_layer = layer.name.to_lowercase().contains("place");
 
             // Colors can originate from user-supplied `style` overrides, so
@@ -321,7 +301,9 @@ fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
     }
     let path = builder.build();
 
-    let mut geometry: VertexBuffers<[f32; 2], u16> = VertexBuffers::new();
+    // u32 indices: a long/thick route can tessellate to more than u16::MAX
+    // (65535) vertices, which would overflow the index and corrupt the mesh.
+    let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
     let mut tessellator = StrokeTessellator::new();
     {
         let mut buffers_builder = BuffersBuilder::new(&mut geometry, |vertex: StrokeVertex| {

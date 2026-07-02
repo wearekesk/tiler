@@ -308,6 +308,12 @@ mod polyline {
             if b < 0x20 {
                 break;
             }
+            // A malformed run of continuation bytes would otherwise push `shift`
+            // past 63, and shifting an i64 by >= 64 bits panics. Treat it as the
+            // end of input instead.
+            if shift >= 64 {
+                return None;
+            }
         }
         let delta = if (result & 1) != 0 {
             !(result >> 1)

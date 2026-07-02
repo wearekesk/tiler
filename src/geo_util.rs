@@ -12,8 +12,15 @@ pub fn lon_to_frac(lon: f64) -> f64 {
     (lon + 180.0) / 360.0
 }
 
+/// The maximum absolute latitude representable in Web Mercator; beyond this the
+/// projection diverges (division by zero / `ln(0)`).
+pub const MAX_MERCATOR_LAT: f64 = 85.051_128_78;
+
 /// Latitude (degrees) to a zoom-independent Web Mercator fraction in `[0, 1)`.
+/// Latitude is clamped to the Web Mercator limit so `±90` (or anything beyond)
+/// can't produce `NaN`/`Infinity` in the projection math.
 pub fn lat_to_frac(lat: f64) -> f64 {
+    let lat = lat.clamp(-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT);
     let lat_rad = lat.to_radians();
     0.5 - ((1.0 + lat_rad.sin()) / (1.0 - lat_rad.sin())).ln() / (4.0 * std::f64::consts::PI)
 }
@@ -116,12 +123,19 @@ impl Viewport {
         let y0 = (self.top_left_y / TILE_SIZE).floor() as i64;
         let y1 = ((self.top_left_y + self.height as f64) / TILE_SIZE).floor() as i64;
 
+        // Cap the number of columns at one full world width: when the viewport
+        // is wider than the world (low zoom + large width), the raw x range
+        // would otherwise wrap around and yield the same tile more than once,
+        // spawning redundant fetch/decode work.
+        let cols = (x1 - x0 + 1).min(tiles_per_axis);
+
         let mut tiles = Vec::new();
         for ty in y0..=y1 {
             if ty < 0 || ty >= tiles_per_axis {
                 continue;
             }
-            for tx in x0..=x1 {
+            for i in 0..cols {
+                let tx = x0 + i;
                 // Wrap tile X around the antimeridian.
                 let wrapped = ((tx % tiles_per_axis) + tiles_per_axis) % tiles_per_axis;
                 tiles.push((self.zoom, wrapped as u32, ty as u32));
