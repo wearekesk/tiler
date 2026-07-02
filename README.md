@@ -49,6 +49,27 @@ Then open, for example:
 http://localhost:3000/staticmap?center=43.7715,11.2540&zoom=15&size=640x480&format=png
 ```
 
+### Docker
+
+A multi-arch image (linux/amd64 + linux/arm64) is published to GitHub Container
+Registry on each release tag:
+
+```sh
+docker run --rm -p 3000:3000 \
+  -e PMTILES_URL="https://protomaps.github.io/PMTiles/protomaps(vector)ODbL_firenze.pmtiles" \
+  ghcr.io/wearekesk/tiler:latest
+```
+
+Or build it locally:
+
+```sh
+docker build -t tiler .
+docker run --rm -p 3000:3000 -e PMTILES_URL=... tiler
+```
+
+The image runs as a non-root user and includes CA certificates (for HTTPS
+PMTiles URLs) and a base font (so text labels render).
+
 ### Configuration
 
 All configuration is via environment variables (a `.env` file is loaded at
