@@ -69,7 +69,10 @@ pub fn render_svg(
 
         for layer in layers {
             let style = style_for_layer(&layer.name, overrides);
-            let bucket = &mut levels[style.z as usize];
+            let zi = style.z as usize;
+            // Casing draws one level below the stroke so all casings sit under
+            // all road fills (keeps intersections connected).
+            let casing_zi = zi.saturating_sub(1);
 
             let scale = 256.0 / layer.extent as f64;
             // Layers that carry named features worth labeling: settlements
@@ -85,6 +88,7 @@ pub fn render_svg(
             // XML injection. Path data is numeric and needs no escaping.
             let fill = style.fill.as_deref().map(xml_escape);
             let stroke = style.stroke.as_deref().map(xml_escape);
+            let casing = style.casing.as_deref().map(xml_escape);
 
             for feature in &layer.features {
                 // Collect a label for named features (points, or lines labeled
@@ -117,10 +121,10 @@ pub fn render_svg(
                             // seal stroke here — a fill-colored seal would stick
                             // out past a thin border (e.g. buildings) as a fuzzy
                             // halo.
-                            bucket.push_str(&format!(
+                            levels[zi].push_str(&format!(
                                 "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"none\" />\n",
                             ));
-                            bucket.push_str(&format!(
+                            levels[zi].push_str(&format!(
                                 "<path d=\"{path_d}\" fill=\"none\" stroke=\"{border}\" stroke-width=\"{}\"{dash} />\n",
                                 style.stroke_width
                             ));
@@ -130,13 +134,21 @@ pub fn render_svg(
                             // with a 1px stroke of the fill color so independently
                             // anti-aliased edges overlap instead of leaving a
                             // hairline seam.
-                            bucket.push_str(&format!(
+                            levels[zi].push_str(&format!(
                                 "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"{fill}\" stroke-width=\"1\" />\n",
                             ));
                         }
                     } else if let Some(stroke) = stroke.as_deref() {
-                        bucket.push_str(&format!(
-                            "<path d=\"{path_d}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{}\"{dash} />\n",
+                        // Optional casing drawn wider, one level below, so it
+                        // reads as an outline around the (later) road fill.
+                        if let Some(casing) = casing.as_deref() {
+                            levels[casing_zi].push_str(&format!(
+                                "<path d=\"{path_d}\" fill=\"none\" stroke=\"{casing}\" stroke-width=\"{}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                                style.stroke_width + 1.6
+                            ));
+                        }
+                        levels[zi].push_str(&format!(
+                            "<path d=\"{path_d}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{}\"{dash} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
                             style.stroke_width
                         ));
                     }
@@ -466,19 +478,32 @@ fn label_for_feature(
 
 fn render_marker_group(viewport: &Viewport, group: &MarkerGroup) -> String {
     let mut out = String::new();
-    let r = group.size.radius();
+    // Head radius of the teardrop pin; the tip sits exactly on the location.
+    let hr = (group.size.radius() * 1.5) as f64;
     // Color and label come from user query parameters; escape before emitting.
     let color = xml_escape(&group.color);
     let label = group.label.map(|c| xml_escape(&c.to_string()));
     for (lat, lon) in &group.points {
         let (mx, my) = viewport.project(*lat, *lon);
+        // Google-style pin: a circular head above a pointed tip. The two sides
+        // run from the tip up to the tangent points of the head circle, then a
+        // major arc closes the head.
+        let cy = my - hr * 2.4;
+        let (ltx, lty) = (mx - hr * 0.909, cy + hr * 0.417);
+        let (rtx, rty) = (mx + hr * 0.909, cy + hr * 0.417);
         out.push_str(&format!(
-            "<circle cx=\"{mx:.2}\" cy=\"{my:.2}\" r=\"{r}\" fill=\"{color}\" stroke=\"#ffffff\" stroke-width=\"2\" />\n",
+            "<path d=\"M {mx:.2} {my:.2} L {ltx:.2} {lty:.2} A {hr:.2} {hr:.2} 0 1 1 {rtx:.2} {rty:.2} Z\" fill=\"{color}\" stroke=\"#3c4043\" stroke-opacity=\"0.25\" stroke-width=\"0.75\" />\n",
         ));
         if let Some(label) = &label {
             out.push_str(&format!(
-                "<text x=\"{mx:.2}\" y=\"{my:.2}\" font-size=\"{:.1}\" font-family=\"sans-serif\" font-weight=\"700\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#ffffff\">{label}</text>\n",
-                r * 1.1
+                "<text x=\"{mx:.2}\" y=\"{cy:.2}\" font-size=\"{:.1}\" font-family=\"sans-serif\" font-weight=\"700\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#ffffff\">{label}</text>\n",
+                hr * 1.15
+            ));
+        } else {
+            // Unlabeled: a small white dot in the head, like Google's default pin.
+            out.push_str(&format!(
+                "<circle cx=\"{mx:.2}\" cy=\"{cy:.2}\" r=\"{:.2}\" fill=\"#ffffff\" />\n",
+                hr * 0.42
             ));
         }
     }

@@ -19,22 +19,26 @@ pub struct Palette {
     pub building_fill: &'static str,
     pub building_stroke: &'static str,
     pub road: &'static str,
+    /// Darker outline drawn under road fills, Google's road "casing".
+    pub road_casing: &'static str,
     pub transit: &'static str,
     pub boundary: &'static str,
     pub other: &'static str,
 }
 
+// Sampled from Google Maps' "roadmap" output so the defaults match closely.
 pub const PALETTE: Palette = Palette {
-    background: "#f4f3ef",
-    landuse: "#c9e8c1",
-    water: "#aadaff",
-    waterway: "#8fbce6",
-    building_fill: "#efece6",
-    building_stroke: "#e2ded6",
+    background: "#f5f4f4",
+    landuse: "#c3f1d5",
+    water: "#90daee",
+    waterway: "#7fc4de",
+    building_fill: "#eaeced",
+    building_stroke: "#d8e0e6",
     road: "#ffffff",
-    transit: "#b5aca3",
-    boundary: "#a9a2c4",
-    other: "#e8e6e0",
+    road_casing: "#d5dde3",
+    transit: "#c5c9d0",
+    boundary: "#c0c4cc",
+    other: "#eef0f2",
 };
 
 pub struct LayerStyle {
@@ -42,6 +46,9 @@ pub struct LayerStyle {
     pub stroke: Option<String>,
     pub stroke_width: f32,
     pub dash: Option<&'static str>,
+    /// Optional casing color drawn as a wider stroke one z-level *below* this
+    /// layer (used for roads, to give Google's outlined look).
+    pub casing: Option<String>,
     /// Painter's-algorithm draw order, lowest first. Rendering is layer-major
     /// across *all* tiles (every tile's `earth` before any tile's `landuse`,
     /// and so on); drawing tile-by-tile instead would let each tile's
@@ -51,7 +58,7 @@ pub struct LayerStyle {
 }
 
 /// Number of distinct z-order buckets; sized to hold every `z` used below.
-pub const Z_LEVELS: usize = 9;
+pub const Z_LEVELS: usize = 10;
 
 pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -> LayerStyle {
     let p = &PALETTE;
@@ -71,6 +78,7 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: None,
                 stroke_width: 0.0,
                 dash: None,
+                casing: None,
                 z: 0,
             },
         )
@@ -86,6 +94,7 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: None,
                 stroke_width: 0.0,
                 dash: None,
+                casing: None,
                 z: 1,
             },
         )
@@ -102,6 +111,7 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: Some(p.waterway.to_string()),
                 stroke_width: 1.0,
                 dash: None,
+                casing: None,
                 z: 3,
             },
         )
@@ -113,6 +123,7 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: None,
                 stroke_width: 0.0,
                 dash: None,
+                casing: None,
                 z: 2,
             },
         )
@@ -124,6 +135,7 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: Some(p.building_stroke.to_string()),
                 stroke_width: 0.5,
                 dash: None,
+                casing: None,
                 z: 4,
             },
         )
@@ -136,10 +148,13 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: Some(p.transit.to_string()),
                 stroke_width: 1.0,
                 dash: Some("5,3"),
+                casing: None,
                 z: 6,
             },
         )
     } else if n.contains("road") || n.contains("transportation") || n.contains("highway") {
+        // White road fill over a darker casing (drawn a z-level below), the
+        // outlined look Google uses.
         (
             "road",
             LayerStyle {
@@ -147,7 +162,8 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: Some(p.road.to_string()),
                 stroke_width: 1.5,
                 dash: None,
-                z: 7,
+                casing: Some(p.road_casing.to_string()),
+                z: 8,
             },
         )
     } else if n.contains("boundary") || n.contains("admin") {
@@ -158,7 +174,8 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: Some(p.boundary.to_string()),
                 stroke_width: 1.0,
                 dash: Some("4,2"),
-                z: 8,
+                casing: None,
+                z: 9,
             },
         )
     } else {
@@ -169,6 +186,7 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke: None,
                 stroke_width: 0.0,
                 dash: None,
+                casing: None,
                 z: 5,
             },
         )
