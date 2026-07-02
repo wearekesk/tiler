@@ -112,19 +112,26 @@ pub fn render_svg(
                         .unwrap_or_default();
 
                     if let Some(fill) = fill.as_deref() {
-                        // Seal each fill with a stroke of its own color so
-                        // independently anti-aliased edges of adjacent same-color
-                        // fills overlap rather than leaving a faint hairline. The
-                        // distinct visible border (e.g. buildings) is drawn as a
-                        // second pass on top so the seal doesn't fatten it.
-                        let seal_width = 1.0f32.max(style.stroke_width);
-                        bucket.push_str(&format!(
-                            "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"{fill}\" stroke-width=\"{seal_width}\" />\n",
-                        ));
                         if let Some(border) = stroke.as_deref() {
+                            // The border already covers the fill's edge, so no
+                            // seal stroke here — a fill-colored seal would stick
+                            // out past a thin border (e.g. buildings) as a fuzzy
+                            // halo.
+                            bucket.push_str(&format!(
+                                "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"none\" />\n",
+                            ));
                             bucket.push_str(&format!(
                                 "<path d=\"{path_d}\" fill=\"none\" stroke=\"{border}\" stroke-width=\"{}\"{dash} />\n",
                                 style.stroke_width
+                            ));
+                        } else {
+                            // Borderless fills (earth/landuse/water) that butt
+                            // against same-color neighbors across tile edges: seal
+                            // with a 1px stroke of the fill color so independently
+                            // anti-aliased edges overlap instead of leaving a
+                            // hairline seam.
+                            bucket.push_str(&format!(
+                                "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"{fill}\" stroke-width=\"1\" />\n",
                             ));
                         }
                     } else if let Some(stroke) = stroke.as_deref() {
@@ -145,9 +152,9 @@ pub fn render_svg(
     label_candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)));
     let mut placed: Vec<[f64; 4]> = Vec::new();
     for c in &label_candidates {
-        // Rough text box: ~6.6px per char at font-size 12, plus vertical slack.
-        let half_w = (c.name.chars().count() as f64 * 3.3).max(6.0) + 2.0;
-        let half_h = 8.0;
+        // Rough text box scaled to the label's font size (~0.55em per char).
+        let half_w = (c.name.chars().count() as f64 * c.font_size * 0.275).max(6.0) + 2.0;
+        let half_h = c.font_size * 0.65;
         let bx = [c.x - half_w, c.y - half_h, c.x + half_w, c.y + half_h];
         let clashes = placed
             .iter()
@@ -267,7 +274,26 @@ struct LabelCandidate {
     y: f64,
     /// Lower is more important (from the tile's `sort_key`, else `-population`).
     priority: i64,
+    font_size: f64,
     svg: String,
+}
+
+/// Label font size (px) by place kind, so countries read larger than cities,
+/// cities larger than towns, and so on.
+fn label_font_size(kind: Option<&str>, kind_detail: Option<&str>) -> f64 {
+    match kind {
+        Some("country") => 16.0,
+        Some("region") | Some("state") | Some("province") => 14.0,
+        Some("ocean") | Some("sea") => 15.0,
+        Some("locality") => match kind_detail {
+            Some("city") => 13.0,
+            Some("town") => 11.0,
+            Some("village") | Some("hamlet") | Some("suburb") => 10.0,
+            _ => 12.0,
+        },
+        Some("lake") | Some("river") | Some("water") => 11.0,
+        _ => 11.0,
+    }
 }
 
 /// Interprets a numeric MVT property value as `f64`, if it is numeric.
@@ -348,16 +374,24 @@ fn label_for_feature(
         .map(|v| v as i64)
         .unwrap_or(0);
 
+    let str_prop = |k: &str| match props.get(k) {
+        Some(Value::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let font_size = label_font_size(str_prop("kind"), str_prop("kind_detail"));
+    let halo = font_size / 4.0;
+
     let escaped = xml_escape(&name);
     let svg = format!(
-        "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"12\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"3\" paint-order=\"stroke\">{escaped}</text>\n\
-         <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"12\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"#333333\">{escaped}</text>\n"
+        "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"{font_size:.1}\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"{halo:.1}\" paint-order=\"stroke\">{escaped}</text>\n\
+         <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"{font_size:.1}\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"#333333\">{escaped}</text>\n"
     );
     Some(LabelCandidate {
         name,
         x,
         y,
         priority,
+        font_size,
         svg,
     })
 }
@@ -439,12 +473,13 @@ fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
     }
 
     for tri in geometry.indices.chunks(3) {
-        if tri.len() < 3 {
+        let (Some(&a), Some(&b), Some(&c)) = (
+            tri.first().and_then(|&i| geometry.vertices.get(i as usize)),
+            tri.get(1).and_then(|&i| geometry.vertices.get(i as usize)),
+            tri.get(2).and_then(|&i| geometry.vertices.get(i as usize)),
+        ) else {
             continue;
-        }
-        let a = geometry.vertices[tri[0] as usize];
-        let b = geometry.vertices[tri[1] as usize];
-        let c = geometry.vertices[tri[2] as usize];
+        };
         out.push_str(&format!(
             "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{color}\" />\n",
             a[0], a[1], b[0], b[1], c[0], c[1]

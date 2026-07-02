@@ -46,6 +46,21 @@ pub fn lat_to_y(lat: f64, zoom: u8) -> f64 {
     lat_to_frac(lat) * tile_size_at_zoom(zoom)
 }
 
+/// The Web-Mercator midpoint (lat, lon) of a set of points — the center of
+/// their bounding box in projected space. Returns `(0, 0)` for an empty slice.
+pub fn center_of(points: &[(f64, f64)]) -> (f64, f64) {
+    if points.is_empty() {
+        return (0.0, 0.0);
+    }
+    let min_lat = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let max_lat = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let min_lon = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let max_lon = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    let center_lat = frac_to_lat((lat_to_frac(min_lat) + lat_to_frac(max_lat)) / 2.0);
+    let center_lon = frac_to_lon((lon_to_frac(min_lon) + lon_to_frac(max_lon)) / 2.0);
+    (center_lat, center_lon)
+}
+
 /// Describes the requested map viewport: center, zoom, and pixel size.
 /// Provides projection helpers from lat/lon to image-space pixels, and
 /// computes which XYZ tiles are needed to cover the viewport.
@@ -88,8 +103,7 @@ impl Viewport {
         let min_lon = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
         let max_lon = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
 
-        let center_lat = frac_to_lat((lat_to_frac(min_lat) + lat_to_frac(max_lat)) / 2.0);
-        let center_lon = frac_to_lon((lon_to_frac(min_lon) + lon_to_frac(max_lon)) / 2.0);
+        let (center_lat, center_lon) = center_of(points);
 
         let lon_frac_span = (lon_to_frac(max_lon) - lon_to_frac(min_lon)).abs();
         let lat_frac_span = (lat_to_frac(min_lat) - lat_to_frac(max_lat)).abs();

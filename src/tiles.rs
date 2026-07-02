@@ -13,12 +13,26 @@ pub enum TileSource {
     Url(AsyncPmTilesReader<HttpBackend, HashMapCache>),
 }
 
+/// A process-wide HTTP client, so all remote sources share one connection pool
+/// (avoids repeated TCP/TLS handshakes and socket churn).
+fn http_client() -> pmtiles::reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<pmtiles::reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            pmtiles::reqwest::Client::builder()
+                .build()
+                .expect("failed to build reqwest client")
+        })
+        .clone()
+}
+
 impl TileSource {
     pub async fn open(source: &str) -> anyhow::Result<Self> {
         if source.starts_with("http://") || source.starts_with("https://") {
             let cache = HashMapCache::default();
-            let client = pmtiles::reqwest::Client::builder().build()?;
-            let reader = AsyncPmTilesReader::new_with_cached_url(cache, client, source).await?;
+            let reader =
+                AsyncPmTilesReader::new_with_cached_url(cache, http_client(), source).await?;
             Ok(TileSource::Url(reader))
         } else {
             let reader = AsyncPmTilesReader::new_with_path(source).await?;

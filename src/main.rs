@@ -298,7 +298,15 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
                     "provide either 'center'+'zoom', or 'visible'/'markers'/'path' points to auto-fit the viewport",
                 ));
             }
-            Viewport::fit(&fit_points, width, height)
+            match (center, zoom) {
+                // `zoom` given but no `center`: keep the requested zoom, just
+                // auto-center on the points instead of also auto-fitting zoom.
+                (None, Some(z)) => {
+                    let (lat, lon) = geo_util::center_of(&fit_points);
+                    Viewport::new(lat, lon, z, width, height)
+                }
+                _ => Viewport::fit(&fit_points, width, height),
+            }
         }
     };
 
