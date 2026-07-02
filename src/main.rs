@@ -127,6 +127,12 @@ fn env_flag(name: &str) -> bool {
 /// with its own internal caches — so open each source once and share it.
 type SourceCache = tokio::sync::Mutex<HashMap<String, Arc<TileSource>>>;
 
+/// Cap on the number of distinct sources kept open. With `PMTILES_ALLOW_PARAM`
+/// enabled a client could otherwise request unbounded unique sources and
+/// exhaust memory; past the cap we evict an existing entry (in-flight requests
+/// keep their own `Arc`, so eviction is safe).
+const MAX_CACHED_SOURCES: usize = 64;
+
 async fn get_source(pmtiles: &str) -> anyhow::Result<Arc<TileSource>> {
     static SOURCES: OnceLock<SourceCache> = OnceLock::new();
     let cache = SOURCES.get_or_init(Default::default);
@@ -137,12 +143,13 @@ async fn get_source(pmtiles: &str) -> anyhow::Result<Arc<TileSource>> {
     // Open outside the lock so a slow open doesn't block other sources; if a
     // concurrent request opened the same source first, keep that one.
     let opened = Arc::new(TileSource::open(pmtiles).await?);
-    Ok(cache
-        .lock()
-        .await
-        .entry(pmtiles.to_string())
-        .or_insert(opened)
-        .clone())
+    let mut map = cache.lock().await;
+    if !map.contains_key(pmtiles) && map.len() >= MAX_CACHED_SOURCES {
+        if let Some(evict) = map.keys().next().cloned() {
+            map.remove(&evict);
+        }
+    }
+    Ok(map.entry(pmtiles.to_string()).or_insert(opened).clone())
 }
 
 fn bad_request(msg: impl std::fmt::Display) -> poem::Error {
@@ -351,8 +358,14 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     let mut response = if format == "svg" {
         Response::builder().content_type("image/svg+xml").body(svg)
     } else {
-        let png = render::svg_to_png(&svg, out_width, out_height)
-            .map_err(|e| internal_error(format!("failed to rasterize png: {e}")))?;
+        // Rasterization is CPU-bound (SVG parse + render up to 8192x8192); run
+        // it on the blocking pool so it doesn't stall the async worker thread
+        // and starve other in-flight requests.
+        let png =
+            tokio::task::spawn_blocking(move || render::svg_to_png(&svg, out_width, out_height))
+                .await
+                .map_err(|e| internal_error(format!("rasterization task panicked: {e}")))?
+                .map_err(|e| internal_error(format!("failed to rasterize png: {e}")))?;
         Response::builder().content_type("image/png").body(png)
     };
 
@@ -383,6 +396,9 @@ async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
     // Kept alive for the process lifetime so buffered spans keep flushing.
     let _telemetry = init_telemetry();
+
+    // Load the system font database now so the first render doesn't pay for it.
+    render::warm_fontdb();
 
     // `CatchPanic` (innermost) turns any handler panic into a 500 instead of
     // killing the worker task; `Tracing` (outermost) still logs the response.

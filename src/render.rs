@@ -352,6 +352,12 @@ fn shared_fontdb() -> Arc<Database> {
     .clone()
 }
 
+/// Eagerly loads the system font database. Call once at startup so the
+/// (synchronous, disk-scanning) load doesn't spike latency on the first render.
+pub fn warm_fontdb() {
+    let _ = shared_fontdb();
+}
+
 /// Rasterizes an SVG document to PNG bytes using resvg/usvg/tiny-skia.
 pub fn svg_to_png(svg: &str, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
     let opt = resvg::usvg::Options {
