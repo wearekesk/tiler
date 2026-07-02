@@ -51,7 +51,9 @@ pub fn parse_latlon(s: &str) -> poem::Result<(f64, f64)> {
         .parse::<f64>()
         .map_err(|e| bad_request(format!("invalid longitude '{s}': {e}")))?;
     if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
-        return Err(bad_request(format!("latitude out of range [-90, 90]: {lat}")));
+        return Err(bad_request(format!(
+            "latitude out of range [-90, 90]: {lat}"
+        )));
     }
     if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
         return Err(bad_request(format!(

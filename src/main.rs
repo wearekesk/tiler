@@ -234,7 +234,9 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
             // value would overflow `1 << zoom` and panic (DoS). No real tileset
             // goes anywhere near this.
             if z > MAX_ZOOM {
-                return Err(bad_request(format!("zoom must be between 0 and {MAX_ZOOM}")));
+                return Err(bad_request(format!(
+                    "zoom must be between 0 and {MAX_ZOOM}"
+                )));
             }
             Some(z)
         }
@@ -370,7 +372,10 @@ async fn main() -> std::io::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    tracing::info!(port, "{SERVICE_NAME} listening on http://0.0.0.0:{port}/staticmap");
+    tracing::info!(
+        port,
+        "{SERVICE_NAME} listening on http://0.0.0.0:{port}/staticmap"
+    );
     Server::new(TcpListener::bind(format!("0.0.0.0:{port}")))
         .run(app)
         .await
