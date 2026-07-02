@@ -125,7 +125,9 @@ fn env_flag(name: &str) -> bool {
 /// Opening a PMTiles archive reads its header + root directory (a network
 /// round-trip for remote URLs), and the reader is thread-safe and reusable
 /// with its own internal caches — so open each source once and share it.
-type SourceCache = tokio::sync::Mutex<HashMap<String, Arc<TileSource>>>;
+// A std (sync) mutex is sufficient: the guard is only ever held for quick map
+// operations and never across the `.await` on `TileSource::open`.
+type SourceCache = std::sync::Mutex<HashMap<String, Arc<TileSource>>>;
 
 /// Cap on the number of distinct sources kept open. With `PMTILES_ALLOW_PARAM`
 /// enabled a client could otherwise request unbounded unique sources and
@@ -137,13 +139,16 @@ async fn get_source(pmtiles: &str) -> anyhow::Result<Arc<TileSource>> {
     static SOURCES: OnceLock<SourceCache> = OnceLock::new();
     let cache = SOURCES.get_or_init(Default::default);
 
-    if let Some(existing) = cache.lock().await.get(pmtiles) {
-        return Ok(existing.clone());
+    {
+        let map = cache.lock().unwrap();
+        if let Some(existing) = map.get(pmtiles) {
+            return Ok(existing.clone());
+        }
     }
     // Open outside the lock so a slow open doesn't block other sources; if a
     // concurrent request opened the same source first, keep that one.
     let opened = Arc::new(TileSource::open(pmtiles).await?);
-    let mut map = cache.lock().await;
+    let mut map = cache.lock().unwrap();
     if !map.contains_key(pmtiles) && map.len() >= MAX_CACHED_SOURCES {
         if let Some(evict) = map.keys().next().cloned() {
             map.remove(&evict);
@@ -191,16 +196,19 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     // local files or reach internal services (SSRF). It is therefore only
     // honored when `PMTILES_ALLOW_PARAM` is explicitly enabled; otherwise the
     // server-configured `PMTILES_URL` is the only source.
-    let pmtiles = match qm.get_one("pmtiles") {
+    let (pmtiles, source_from_client) = match qm.get_one("pmtiles") {
         Some(_) if !env_flag("PMTILES_ALLOW_PARAM") => {
             return Err(forbidden(
                 "the 'pmtiles' parameter is disabled; set PMTILES_ALLOW_PARAM=1 to allow it",
             ));
         }
-        Some(p) => p.to_string(),
-        None => std::env::var("PMTILES_URL").ok().ok_or_else(|| {
-            bad_request("missing 'pmtiles' parameter (and no PMTILES_URL env var set)")
-        })?,
+        Some(p) => (p.to_string(), true),
+        None => (
+            std::env::var("PMTILES_URL").ok().ok_or_else(|| {
+                bad_request("missing 'pmtiles' parameter (and no PMTILES_URL env var set)")
+            })?,
+            false,
+        ),
     };
 
     // Short-circuit unchanged renders: if the client already holds this exact
@@ -310,9 +318,16 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         }
     };
 
-    let source = get_source(&pmtiles)
-        .await
-        .map_err(|e| internal_error(format!("failed to open pmtiles source: {e}")))?;
+    let source = get_source(&pmtiles).await.map_err(|e| {
+        // A client-supplied source that fails to open (bad/unreachable URL) is
+        // a client error, not a server fault — don't log it as a 500.
+        let msg = format!("failed to open pmtiles source: {e}");
+        if source_from_client {
+            bad_request(msg)
+        } else {
+            internal_error(msg)
+        }
+    })?;
 
     let covering = viewport.covering_tiles();
     tracing::debug!(

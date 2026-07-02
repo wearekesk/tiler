@@ -14,13 +14,17 @@ pub enum TileSource {
 }
 
 /// A process-wide HTTP client, so all remote sources share one connection pool
-/// (avoids repeated TCP/TLS handshakes and socket churn).
+/// (avoids repeated TCP/TLS handshakes and socket churn). Timeouts are set so a
+/// hung or slow remote can't tie up connections indefinitely.
 fn http_client() -> pmtiles::reqwest::Client {
     use std::sync::OnceLock;
+    use std::time::Duration;
     static CLIENT: OnceLock<pmtiles::reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             pmtiles::reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
                 .build()
                 .expect("failed to build reqwest client")
         })
