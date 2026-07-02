@@ -46,9 +46,10 @@ pub fn render_svg(
     let mut labels = String::new();
     // Place points are duplicated into every tile whose buffer covers them, so
     // the same label would otherwise be drawn once per tile (a few pixels
-    // apart, appearing as doubled/bold text). Keep only the first occurrence
-    // of each name.
-    let mut seen_labels: HashSet<String> = HashSet::new();
+    // apart, appearing as doubled/bold text). Deduplicate by name *and* a coarse
+    // output-space grid cell, so cross-tile copies collapse without suppressing
+    // genuinely distinct places that happen to share a name.
+    let mut seen_labels: HashSet<(String, i64, i64)> = HashSet::new();
 
     // Render layer-major (painter's algorithm) across *all* tiles: everything
     // is drawn into a per-z-level bucket, then the buckets are concatenated
@@ -78,8 +79,14 @@ pub fn render_svg(
 
             for feature in &layer.features {
                 if is_label_layer {
-                    if let Some((name, l)) = label_for_feature(feature, scale, offset_x, offset_y) {
-                        if seen_labels.insert(name) {
+                    if let Some((name, lx, ly, l)) =
+                        label_for_feature(feature, scale, offset_x, offset_y)
+                    {
+                        // ~128px grid: near-identical positions (the same place
+                        // seen from adjacent tiles) collapse; far-apart places
+                        // with the same name do not.
+                        let cell = ((lx / 128.0).floor() as i64, (ly / 128.0).floor() as i64);
+                        if seen_labels.insert((name, cell.0, cell.1)) {
                             labels.push_str(&l);
                         }
                     }
@@ -204,8 +211,9 @@ fn append_ring(d: &mut String, ring: &LineString<f32>, scale: f64, ox: f64, oy: 
 }
 
 /// Renders a point-layer feature's `name` property as a halo'd text label,
-/// if present. Returns the place name alongside the SVG so the caller can
-/// deduplicate labels that appear in more than one tile. Only `Point`/
+/// if present. Returns the place name and its output-space position alongside
+/// the SVG so the caller can deduplicate labels that appear in more than one
+/// tile without collapsing distinct places that share a name. Only `Point`/
 /// `MultiPoint` geometries are supported; line and polygon labels (e.g. road
 /// names) are not placed.
 fn label_for_feature(
@@ -213,7 +221,7 @@ fn label_for_feature(
     scale: f64,
     ox: f64,
     oy: f64,
-) -> Option<(String, String)> {
+) -> Option<(String, f64, f64, String)> {
     let name = feature.properties.as_ref().and_then(|props| {
         props
             .get("name")
@@ -238,7 +246,7 @@ fn label_for_feature(
         "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"12\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"3\" paint-order=\"stroke\">{escaped}</text>\n\
          <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"12\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"#333333\">{escaped}</text>\n"
     );
-    Some((name, svg))
+    Some((name, x, y, svg))
 }
 
 fn render_marker_group(viewport: &Viewport, group: &MarkerGroup) -> String {

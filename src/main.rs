@@ -22,14 +22,15 @@ mod render;
 mod style;
 mod tiles;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use geo::algorithm::line_measures::{Haversine, Length};
 use geo_types::LineString;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
-use poem::http::StatusCode;
+use poem::http::{HeaderValue, StatusCode};
 use poem::listener::TcpListener;
 use poem::middleware::{CatchPanic, Tracing};
 use poem::{get, handler, EndpointExt, Request, Response, Route, Server};
@@ -118,6 +119,30 @@ fn env_flag(name: &str) -> bool {
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
         })
         .unwrap_or(false)
+}
+
+/// Process-wide cache of opened tile sources, keyed by source string.
+/// Opening a PMTiles archive reads its header + root directory (a network
+/// round-trip for remote URLs), and the reader is thread-safe and reusable
+/// with its own internal caches — so open each source once and share it.
+type SourceCache = tokio::sync::Mutex<HashMap<String, Arc<TileSource>>>;
+
+async fn get_source(pmtiles: &str) -> anyhow::Result<Arc<TileSource>> {
+    static SOURCES: OnceLock<SourceCache> = OnceLock::new();
+    let cache = SOURCES.get_or_init(Default::default);
+
+    if let Some(existing) = cache.lock().await.get(pmtiles) {
+        return Ok(existing.clone());
+    }
+    // Open outside the lock so a slow open doesn't block other sources; if a
+    // concurrent request opened the same source first, keep that one.
+    let opened = Arc::new(TileSource::open(pmtiles).await?);
+    Ok(cache
+        .lock()
+        .await
+        .entry(pmtiles.to_string())
+        .or_insert(opened)
+        .clone())
 }
 
 fn bad_request(msg: impl std::fmt::Display) -> poem::Error {
@@ -270,11 +295,9 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         }
     };
 
-    let source = Arc::new(
-        TileSource::open(&pmtiles)
-            .await
-            .map_err(|e| internal_error(format!("failed to open pmtiles source: {e}")))?,
-    );
+    let source = get_source(&pmtiles)
+        .await
+        .map_err(|e| internal_error(format!("failed to open pmtiles source: {e}")))?;
 
     let covering = viewport.covering_tiles();
     tracing::debug!(
@@ -343,11 +366,12 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     if let Some(p) = longest_path {
         if p.points.len() >= 2 {
             let line: LineString<f64> = p.points.iter().map(|(lat, lon)| (*lon, *lat)).collect();
-            let meters = Haversine.length(&line);
-            response.headers_mut().insert(
-                "x-route-length-meters",
-                meters.round().to_string().parse().unwrap(),
-            );
+            // `f64 as u64` saturates (>= 0, NaN -> 0), and `HeaderValue::from`
+            // for an integer is infallible — no string round-trip needed.
+            let meters = Haversine.length(&line).round() as u64;
+            response
+                .headers_mut()
+                .insert("x-route-length-meters", HeaderValue::from(meters));
         }
     }
 

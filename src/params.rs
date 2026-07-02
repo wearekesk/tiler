@@ -196,7 +196,21 @@ pub fn parse_path_spec(raw: &str) -> poem::Result<PathSpec> {
     }
 
     if let Some(encoded) = encoded_part {
-        points.extend(polyline::decode(encoded));
+        // Validate decoded coordinates the same way as literal `lat,lon` pairs;
+        // a crafted polyline could otherwise decode to out-of-range values that
+        // bypass `parse_latlon` and feed bad numbers into the projection.
+        for (lat, lon) in polyline::decode(encoded) {
+            if !lat.is_finite()
+                || !(-90.0..=90.0).contains(&lat)
+                || !lon.is_finite()
+                || !(-180.0..=180.0).contains(&lon)
+            {
+                return Err(bad_request(format!(
+                    "encoded polyline has out-of-range coordinate: {lat},{lon}"
+                )));
+            }
+            points.push((lat, lon));
+        }
     }
 
     Ok(PathSpec {
@@ -279,20 +293,26 @@ mod polyline {
         const FACTOR: f64 = 1e5;
 
         while index < bytes.len() {
-            match decode_value(bytes, index) {
-                Some((dlat, next)) => {
-                    lat += dlat;
-                    index = next;
-                }
+            // `checked_add` so a malicious stream of large deltas can't overflow
+            // the accumulator and panic in debug builds; stop decoding instead.
+            let (dlat, next) = match decode_value(bytes, index) {
+                Some(v) => v,
                 None => break,
-            }
-            match decode_value(bytes, index) {
-                Some((dlon, next)) => {
-                    lon += dlon;
-                    index = next;
-                }
+            };
+            index = next;
+            lat = match lat.checked_add(dlat) {
+                Some(v) => v,
                 None => break,
-            }
+            };
+            let (dlon, next) = match decode_value(bytes, index) {
+                Some(v) => v,
+                None => break,
+            };
+            index = next;
+            lon = match lon.checked_add(dlon) {
+                Some(v) => v,
+                None => break,
+            };
             coords.push((lat as f64 / FACTOR, lon as f64 / FACTOR));
         }
 
