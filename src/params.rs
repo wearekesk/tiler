@@ -33,7 +33,10 @@ impl QueryMap {
     }
 }
 
-fn parse_latlon(s: &str) -> poem::Result<(f64, f64)> {
+/// Parses a `lat,lon` pair, rejecting non-finite values and coordinates
+/// outside their physical ranges (latitude `[-90, 90]`, longitude
+/// `[-180, 180]`) so `NaN`/`Infinity` can't flow into the projection math.
+pub fn parse_latlon(s: &str) -> poem::Result<(f64, f64)> {
     let mut parts = s.split(',');
     let lat = parts
         .next()
@@ -47,7 +50,26 @@ fn parse_latlon(s: &str) -> poem::Result<(f64, f64)> {
         .trim()
         .parse::<f64>()
         .map_err(|e| bad_request(format!("invalid longitude '{s}': {e}")))?;
+    if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+        return Err(bad_request(format!("latitude out of range [-90, 90]: {lat}")));
+    }
+    if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+        return Err(bad_request(format!(
+            "longitude out of range [-180, 180]: {lon}"
+        )));
+    }
     Ok((lat, lon))
+}
+
+/// Parses a non-negative, finite stroke weight, rejecting `NaN`/`Infinity`.
+fn parse_weight(value: &str, what: &str) -> poem::Result<f32> {
+    let w = value
+        .parse::<f32>()
+        .map_err(|e| bad_request(format!("invalid {what}: {e}")))?;
+    if !w.is_finite() || w < 0.0 {
+        return Err(bad_request(format!("{what} must be finite and >= 0: {w}")));
+    }
+    Ok(w)
 }
 
 /// Normalizes a Google-style `0xRRGGBB[AA]` color into a CSS/SVG-compatible
@@ -159,11 +181,7 @@ pub fn parse_path_spec(raw: &str) -> poem::Result<PathSpec> {
         if let Some((key, value)) = token.split_once(':') {
             match key.to_lowercase().as_str() {
                 "color" => color = normalize_color(value),
-                "weight" => {
-                    weight = value
-                        .parse::<f32>()
-                        .map_err(|e| bad_request(format!("invalid path weight: {e}")))?
-                }
+                "weight" => weight = parse_weight(value, "path weight")?,
                 "fillcolor" => fillcolor = Some(normalize_color(value)),
                 // `geodesic` is accepted but has no effect: our paths are
                 // already rendered as straight segments in projected space.
@@ -212,13 +230,7 @@ pub fn parse_style_override(raw: &str) -> poem::Result<(String, StyleOverride)> 
             match key.to_lowercase().as_str() {
                 "feature" => feature = value.to_lowercase(),
                 "color" => over.color = Some(normalize_color(value)),
-                "weight" => {
-                    over.weight = Some(
-                        value
-                            .parse::<f32>()
-                            .map_err(|e| bad_request(format!("invalid style weight: {e}")))?,
-                    )
-                }
+                "weight" => over.weight = Some(parse_weight(value, "style weight")?),
                 _ => {}
             }
         }

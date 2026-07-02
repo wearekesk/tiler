@@ -186,9 +186,14 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
 
 fn apply_override(style: &mut LayerStyle, o: &StyleOverride) {
     if let Some(c) = &o.color {
+        // Recolor whichever channels the bucket actually uses. Buckets like
+        // `building` set both a fill and a distinct outline stroke; applying the
+        // override to both honors the user's intent instead of silently
+        // recoloring only the fill.
         if style.fill.is_some() {
             style.fill = Some(c.clone());
-        } else {
+        }
+        if style.stroke.is_some() {
             style.stroke = Some(c.clone());
         }
     }

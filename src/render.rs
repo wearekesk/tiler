@@ -35,6 +35,7 @@ fn xml_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -89,6 +90,12 @@ pub fn render_svg(
             let offset_y = tile_offset_y - TILE_BLEED_PX;
             let is_label_layer = layer.name.to_lowercase().contains("place");
 
+            // Colors can originate from user-supplied `style` overrides, so
+            // escape them (once per layer) before they reach the SVG to avoid
+            // XML injection. Path data is numeric and needs no escaping.
+            let fill = style.fill.as_deref().map(xml_escape);
+            let stroke = style.stroke.as_deref().map(xml_escape);
+
             for feature in &layer.features {
                 if is_label_layer {
                     if let Some((name, l)) = label_for_feature(feature, scale, offset_x, offset_y) {
@@ -106,7 +113,7 @@ pub fn render_svg(
                         .map(|d| format!(" stroke-dasharray=\"{d}\""))
                         .unwrap_or_default();
 
-                    if let Some(fill) = style.fill.as_deref() {
+                    if let Some(fill) = fill.as_deref() {
                         // Seal each fill with a stroke of its own color so
                         // independently anti-aliased edges of adjacent same-color
                         // fills overlap rather than leaving a faint hairline. The
@@ -116,13 +123,13 @@ pub fn render_svg(
                         bucket.push_str(&format!(
                             "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"{fill}\" stroke-width=\"{seal_width}\" />\n",
                         ));
-                        if let Some(border) = style.stroke.as_deref() {
+                        if let Some(border) = stroke.as_deref() {
                             bucket.push_str(&format!(
                                 "<path d=\"{path_d}\" fill=\"none\" stroke=\"{border}\" stroke-width=\"{}\"{dash} />\n",
                                 style.stroke_width
                             ));
                         }
-                    } else if let Some(stroke) = style.stroke.as_deref() {
+                    } else if let Some(stroke) = stroke.as_deref() {
                         bucket.push_str(&format!(
                             "<path d=\"{path_d}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{}\"{dash} />\n",
                             style.stroke_width
@@ -257,13 +264,15 @@ fn label_for_feature(
 fn render_marker_group(viewport: &Viewport, group: &MarkerGroup) -> String {
     let mut out = String::new();
     let r = group.size.radius();
+    // Color and label come from user query parameters; escape before emitting.
+    let color = xml_escape(&group.color);
+    let label = group.label.map(|c| xml_escape(&c.to_string()));
     for (lat, lon) in &group.points {
         let (mx, my) = viewport.project(*lat, *lon);
         out.push_str(&format!(
-            "<circle cx=\"{mx:.2}\" cy=\"{my:.2}\" r=\"{r}\" fill=\"{}\" stroke=\"#ffffff\" stroke-width=\"2\" />\n",
-            group.color
+            "<circle cx=\"{mx:.2}\" cy=\"{my:.2}\" r=\"{r}\" fill=\"{color}\" stroke=\"#ffffff\" stroke-width=\"2\" />\n",
         ));
-        if let Some(label) = group.label {
+        if let Some(label) = &label {
             out.push_str(&format!(
                 "<text x=\"{mx:.2}\" y=\"{my:.2}\" font-size=\"{:.1}\" font-family=\"sans-serif\" font-weight=\"700\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#ffffff\">{label}</text>\n",
                 r * 1.1
@@ -275,10 +284,13 @@ fn render_marker_group(viewport: &Viewport, group: &MarkerGroup) -> String {
 
 fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
     let mut out = String::new();
+    // Colors come from user query parameters; escape before emitting to SVG.
+    let color = xml_escape(&spec.color);
 
     // Optional polygon fill: render the raw point list as a closed ring
     // first (beneath the stroked line), akin to Google's `fillcolor`.
     if let Some(fillcolor) = &spec.fillcolor {
+        let fillcolor = xml_escape(fillcolor);
         let mut d = String::new();
         for (i, (lat, lon)) in spec.points.iter().enumerate() {
             let (x, y) = viewport.project(*lat, *lon);
@@ -331,8 +343,8 @@ fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
         let b = geometry.vertices[tri[1] as usize];
         let c = geometry.vertices[tri[2] as usize];
         out.push_str(&format!(
-            "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{}\" />\n",
-            a[0], a[1], b[0], b[1], c[0], c[1], spec.color
+            "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{color}\" />\n",
+            a[0], a[1], b[0], b[1], c[0], c[1]
         ));
     }
     out

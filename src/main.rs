@@ -22,6 +22,8 @@ mod render;
 mod style;
 mod tiles;
 
+use std::sync::Arc;
+
 use geo::algorithm::line_measures::{Haversine, Length};
 use geo_types::LineString;
 use opentelemetry::trace::TracerProvider as _;
@@ -88,38 +90,42 @@ fn init_telemetry() -> Option<SdkTracerProvider> {
 /// time. `immutable` tells browsers never to revalidate within the window.
 const CACHE_CONTROL: &str = "public, max-age=86400, s-maxage=604800, immutable";
 
-/// A weak-ish content ETag derived from the request's query string, which
-/// uniquely determines the rendered output.
-fn etag_for_query(query: &str) -> String {
+/// Upper bound on each *scaled* output dimension (px). Caps pixmap allocation
+/// so a large `size` x `scale` can't exhaust memory (8192x8192 RGBA ~= 256 MiB).
+const MAX_OUTPUT_DIM: u32 = 8192;
+
+/// Content ETag for a request. Folds in the query string, the resolved tile
+/// source, and the renderer version so a `304 Not Modified` can't serve stale
+/// output after the source or the code changes.
+fn etag_for_request(query: &str, source: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     query.hash(&mut h);
+    source.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
     format!("\"{:016x}\"", h.finish())
+}
+
+/// Reads a boolean-ish environment flag (`1`/`true`/`yes`, case-insensitive).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
 }
 
 fn bad_request(msg: impl std::fmt::Display) -> poem::Error {
     poem::Error::from_string(msg.to_string(), StatusCode::BAD_REQUEST)
 }
 
-fn internal_error(msg: impl std::fmt::Display) -> poem::Error {
-    poem::Error::from_string(msg.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+fn forbidden(msg: impl std::fmt::Display) -> poem::Error {
+    poem::Error::from_string(msg.to_string(), StatusCode::FORBIDDEN)
 }
 
-fn parse_latlon(s: &str) -> poem::Result<(f64, f64)> {
-    let mut parts = s.split(',');
-    let lat = parts
-        .next()
-        .ok_or_else(|| bad_request("missing latitude"))?
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| bad_request(format!("invalid latitude: {e}")))?;
-    let lon = parts
-        .next()
-        .ok_or_else(|| bad_request("missing longitude"))?
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| bad_request(format!("invalid longitude: {e}")))?;
-    Ok((lat, lon))
+fn internal_error(msg: impl std::fmt::Display) -> poem::Error {
+    poem::Error::from_string(msg.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn parse_size(s: &str) -> poem::Result<(u32, u32)> {
@@ -142,10 +148,28 @@ fn parse_size(s: &str) -> poem::Result<(u32, u32)> {
 #[handler]
 async fn static_map(req: &Request) -> poem::Result<Response> {
     let query = req.uri().query().unwrap_or("");
-    let etag = etag_for_query(query);
+    let qm = QueryMap::parse(query);
+
+    // Resolve the tile source. The `pmtiles` query parameter can name an
+    // arbitrary path or URL, which would let an unauthenticated client read
+    // local files or reach internal services (SSRF). It is therefore only
+    // honored when `PMTILES_ALLOW_PARAM` is explicitly enabled; otherwise the
+    // server-configured `PMTILES_URL` is the only source.
+    let pmtiles = match qm.get_one("pmtiles") {
+        Some(_) if !env_flag("PMTILES_ALLOW_PARAM") => {
+            return Err(forbidden(
+                "the 'pmtiles' parameter is disabled; set PMTILES_ALLOW_PARAM=1 to allow it",
+            ));
+        }
+        Some(p) => p.to_string(),
+        None => std::env::var("PMTILES_URL").ok().ok_or_else(|| {
+            bad_request("missing 'pmtiles' parameter (and no PMTILES_URL env var set)")
+        })?,
+    };
 
     // Short-circuit unchanged renders: if the client already holds this exact
     // output, skip all fetching/rasterization and return 304.
+    let etag = etag_for_request(query, &pmtiles);
     if req
         .headers()
         .get("if-none-match")
@@ -158,16 +182,6 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
             .header("cache-control", CACHE_CONTROL)
             .finish());
     }
-
-    let qm = QueryMap::parse(query);
-
-    let pmtiles = qm
-        .get_one("pmtiles")
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("PMTILES_URL").ok())
-        .ok_or_else(|| {
-            bad_request("missing 'pmtiles' parameter (and no PMTILES_URL env var set)")
-        })?;
 
     let (width, height) = parse_size(
         qm.get_one("size")
@@ -187,9 +201,26 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         return Err(bad_request("scale must be 1, 2, or 4"));
     }
 
-    let format = qm.get_one("format").unwrap_or("png").to_string();
+    // Guard against oversized allocations: an unguarded `size=4096x4096&scale=4`
+    // would demand a 16384x16384 pixmap (~1 GiB) and could OOM the process.
+    let out_width = width * scale;
+    let out_height = height * scale;
+    if out_width > MAX_OUTPUT_DIM || out_height > MAX_OUTPUT_DIM {
+        return Err(bad_request(format!(
+            "scaled output {out_width}x{out_height} exceeds {MAX_OUTPUT_DIM}x{MAX_OUTPUT_DIM}; reduce size or scale"
+        )));
+    }
 
-    let center: Option<(f64, f64)> = qm.get_one("center").map(parse_latlon).transpose()?;
+    let format = match qm.get_one("format").unwrap_or("png") {
+        f @ ("png" | "svg") => f.to_string(),
+        other => {
+            return Err(bad_request(format!(
+                "invalid format '{other}': expected 'png' or 'svg'"
+            )))
+        }
+    };
+
+    let center: Option<(f64, f64)> = qm.get_one("center").map(params::parse_latlon).transpose()?;
     let zoom: Option<u8> = match qm.get_one("zoom") {
         Some(s) => Some(
             s.parse()
@@ -225,9 +256,11 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         }
     };
 
-    let source = TileSource::open(&pmtiles)
-        .await
-        .map_err(|e| internal_error(format!("failed to open pmtiles source: {e}")))?;
+    let source = Arc::new(
+        TileSource::open(&pmtiles)
+            .await
+            .map_err(|e| internal_error(format!("failed to open pmtiles source: {e}")))?,
+    );
 
     let covering = viewport.covering_tiles();
     tracing::debug!(
@@ -238,24 +271,36 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         "rendering static map"
     );
 
-    let mut tiles = Vec::new();
+    // Fetch tiles concurrently: with a remote PMTiles URL, sequential
+    // round-trips would dominate latency. A tile that fails to fetch is skipped
+    // rather than failing the whole request.
+    let mut set = tokio::task::JoinSet::new();
     for (z, x, y) in covering {
-        match source.get_tile(z, x, y).await {
-            Ok(Some(bytes)) => {
-                if let Ok(layers) = tiles::decode_tile(bytes.to_vec()) {
-                    tiles.push(((z, x, y), layers));
+        let source = source.clone();
+        set.spawn(async move {
+            match source.get_tile(z, x, y).await {
+                Ok(Some(bytes)) => tiles::decode_tile(bytes.to_vec())
+                    .ok()
+                    .map(|layers| ((z, x, y), layers)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(z, x, y, error = %e, "failed to fetch tile");
+                    None
                 }
             }
-            Ok(None) => {}
-            Err(e) => {
-                // Skip tiles that fail to fetch rather than failing the whole request.
-                tracing::warn!(z, x, y, error = %e, "failed to fetch tile");
-            }
-        }
+        });
     }
 
-    let out_width = width * scale;
-    let out_height = height * scale;
+    let mut tiles = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(tile)) = res {
+            tiles.push(tile);
+        }
+    }
+    // Restore a deterministic order (JoinSet completes out of order) so the
+    // per-tile bleed overlap composites identically across requests.
+    tiles.sort_by_key(|((z, x, y), _)| (*z, *x, *y));
+
     let svg = render_svg(
         &viewport,
         &tiles,
