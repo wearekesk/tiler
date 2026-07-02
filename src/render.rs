@@ -278,21 +278,71 @@ struct LabelCandidate {
     svg: String,
 }
 
-/// Label font size (px) by place kind, so countries read larger than cities,
-/// cities larger than towns, and so on.
-fn label_font_size(kind: Option<&str>, kind_detail: Option<&str>) -> f64 {
+/// How a label is drawn, chosen by place kind to loosely follow Google Maps
+/// "roadmap" conventions: uppercase, letter-spaced country/region names; a
+/// weighted size hierarchy for settlements; and italic blue-grey water labels.
+struct LabelStyle {
+    size: f64,
+    color: &'static str,
+    italic: bool,
+    upper: bool,
+    tracking: f64,
+    weight: u32,
+}
+
+fn label_style(kind: Option<&str>, kind_detail: Option<&str>) -> LabelStyle {
+    let base = LabelStyle {
+        size: 11.0,
+        color: "#3c4043",
+        italic: false,
+        upper: false,
+        tracking: 0.0,
+        weight: 400,
+    };
     match kind {
-        Some("country") => 16.0,
-        Some("region") | Some("state") | Some("province") => 14.0,
-        Some("ocean") | Some("sea") => 15.0,
-        Some("locality") => match kind_detail {
-            Some("city") => 13.0,
-            Some("town") => 11.0,
-            Some("village") | Some("hamlet") | Some("suburb") => 10.0,
-            _ => 12.0,
+        Some("country") => LabelStyle {
+            size: 13.0,
+            upper: true,
+            tracking: 1.5,
+            weight: 500,
+            ..base
         },
-        Some("lake") | Some("river") | Some("water") => 11.0,
-        _ => 11.0,
+        Some("region") | Some("state") | Some("province") => LabelStyle {
+            size: 11.0,
+            color: "#5f6368",
+            upper: true,
+            tracking: 1.0,
+            weight: 500,
+            ..base
+        },
+        Some("ocean") | Some("sea") => LabelStyle {
+            size: 14.0,
+            color: "#48688f",
+            italic: true,
+            ..base
+        },
+        Some("lake") | Some("river") | Some("water") | Some("stream") | Some("canal") => {
+            LabelStyle {
+                color: "#48688f",
+                italic: true,
+                ..base
+            }
+        }
+        Some("locality") => match kind_detail {
+            Some("city") => LabelStyle {
+                size: 14.0,
+                weight: 500,
+                ..base
+            },
+            Some("town") => LabelStyle { size: 12.0, ..base },
+            Some("village") | Some("hamlet") | Some("suburb") => LabelStyle {
+                size: 10.0,
+                color: "#5f6368",
+                ..base
+            },
+            _ => LabelStyle { size: 12.0, ..base },
+        },
+        _ => base,
     }
 }
 
@@ -378,16 +428,34 @@ fn label_for_feature(
         Some(Value::String(s)) => Some(s.as_str()),
         _ => None,
     };
-    let font_size = label_font_size(str_prop("kind"), str_prop("kind_detail"));
+    let ls = label_style(str_prop("kind"), str_prop("kind_detail"));
+    let font_size = ls.size;
     let halo = font_size / 4.0;
 
-    let escaped = xml_escape(&name);
+    let display = if ls.upper {
+        name.to_uppercase()
+    } else {
+        name.clone()
+    };
+    let escaped = xml_escape(&display);
+    let style_attrs = format!(
+        "font-size=\"{size:.1}\" font-family=\"sans-serif\" font-weight=\"{weight}\"{italic}{tracking} text-anchor=\"middle\"",
+        size = font_size,
+        weight = ls.weight,
+        italic = if ls.italic { " font-style=\"italic\"" } else { "" },
+        tracking = if ls.tracking > 0.0 {
+            format!(" letter-spacing=\"{:.1}\"", ls.tracking)
+        } else {
+            String::new()
+        },
+    );
     let svg = format!(
-        "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"{font_size:.1}\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"{halo:.1}\" paint-order=\"stroke\">{escaped}</text>\n\
-         <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"{font_size:.1}\" font-family=\"sans-serif\" font-weight=\"600\" text-anchor=\"middle\" fill=\"#333333\">{escaped}</text>\n"
+        "<text x=\"{x:.1}\" y=\"{y:.1}\" {style_attrs} fill=\"none\" stroke=\"#ffffff\" stroke-width=\"{halo:.1}\" paint-order=\"stroke\">{escaped}</text>\n\
+         <text x=\"{x:.1}\" y=\"{y:.1}\" {style_attrs} fill=\"{color}\">{escaped}</text>\n",
+        color = ls.color,
     );
     Some(LabelCandidate {
-        name,
+        name: display,
         x,
         y,
         priority,
