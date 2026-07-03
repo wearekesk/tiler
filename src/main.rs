@@ -377,9 +377,9 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         );
         let out: (Vec<u8>, &'static str) = match format.as_str() {
             "svg" => (svg.into_bytes(), "image/svg+xml"),
-            // Quality 85: a good size/quality balance for map imagery.
+            // Quality 100: maximum fidelity (map imagery has sharp edges/text).
             "jpeg" | "jpg" => (
-                render::svg_to_jpeg(&svg, out_width, out_height, 85)?,
+                render::svg_to_jpeg(&svg, out_width, out_height, 100)?,
                 "image/jpeg",
             ),
             _ => (
