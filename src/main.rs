@@ -2,15 +2,14 @@
 //! Static API), backed by a PMTiles vector tile archive.
 //!
 //! `GET /staticmap?size=WxH
-//!      [&pmtiles=PATH_OR_URL]
 //!      [&center=LAT,LON&zoom=Z][&scale=1|2|4][&format=png|svg]
 //!      [&markers=[color:C|label:L|size:S|]LAT,LON|LAT,LON..]* (repeatable)
 //!      [&path=[color:C|weight:W|fillcolor:C|]LAT,LON|LAT,LON..|enc:POLYLINE]* (repeatable)
 //!      [&style=feature:F|color:C|weight:W]* (repeatable)
 //!      [&visible=LAT,LON|LAT,LON..]* (repeatable)`
 //!
-//! `pmtiles` may be omitted if a `PMTILES_URL` variable is set (via the
-//! environment, or a `.env` file loaded at startup with the `dotenv` crate).
+//! The tile source is fixed by the `PMTILES_URL` variable (via the environment,
+//! or a `.env` file loaded at startup with the `dotenv` crate).
 //!
 //! If `center`+`zoom` are omitted, the viewport is automatically fit to
 //! contain all `visible`, `markers`, and `path` points (like Google's
@@ -111,23 +110,7 @@ fn etag_for_request(query: &str, source: &str) -> String {
     format!("\"{:016x}\"", h.finish())
 }
 
-/// Reads a boolean-ish environment flag (`1`/`true`/`yes`, case-insensitive).
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
-}
-
-/// Whether the `pmtiles` query parameter is honored. Read once (static config).
-fn allow_pmtiles_param() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| env_flag("PMTILES_ALLOW_PARAM"))
-}
-
-/// The server-configured default source. Read once (static config).
+/// The server-configured tile source. Read once (static config).
 fn configured_pmtiles_url() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();
     V.get_or_init(|| std::env::var("PMTILES_URL").ok())
@@ -142,44 +125,27 @@ fn configured_pmtiles_url() -> Option<&'static str> {
 // operations and never across the `.await` on `TileSource::open`.
 type SourceCache = std::sync::Mutex<HashMap<String, Arc<TileSource>>>;
 
-/// Cap on the number of distinct sources kept open. With `PMTILES_ALLOW_PARAM`
-/// enabled a client could otherwise request unbounded unique sources and
-/// exhaust memory; past the cap we evict an existing entry (in-flight requests
-/// keep their own `Arc`, so eviction is safe).
-const MAX_CACHED_SOURCES: usize = 64;
-
 async fn get_source(pmtiles: &str) -> anyhow::Result<Arc<TileSource>> {
     static SOURCES: OnceLock<SourceCache> = OnceLock::new();
     let cache = SOURCES.get_or_init(Default::default);
 
+    // `unwrap_or_else(into_inner)` recovers the guard even if a thread panicked
+    // while holding the lock (poisoning), instead of cascading the panic.
     {
-        let map = cache.lock().unwrap();
+        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get(pmtiles) {
             return Ok(existing.clone());
         }
     }
-    // Open outside the lock so a slow open doesn't block other sources; if a
-    // concurrent request opened the same source first, keep that one.
+    // Open outside the lock so a slow open doesn't block; if a concurrent
+    // request opened the same source first, keep that one.
     let opened = Arc::new(TileSource::open(pmtiles).await?);
-    let mut map = cache.lock().unwrap();
-    if !map.contains_key(pmtiles) && map.len() >= MAX_CACHED_SOURCES {
-        // Never evict the server-configured default source, so a flood of unique
-        // client-supplied sources can't force slow re-opens of the common one.
-        let default = configured_pmtiles_url();
-        let victim = map.keys().find(|k| Some(k.as_str()) != default).cloned();
-        if let Some(evict) = victim {
-            map.remove(&evict);
-        }
-    }
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
     Ok(map.entry(pmtiles.to_string()).or_insert(opened).clone())
 }
 
 fn bad_request(msg: impl std::fmt::Display) -> poem::Error {
     poem::Error::from_string(msg.to_string(), StatusCode::BAD_REQUEST)
-}
-
-fn forbidden(msg: impl std::fmt::Display) -> poem::Error {
-    poem::Error::from_string(msg.to_string(), StatusCode::FORBIDDEN)
 }
 
 fn internal_error(msg: impl std::fmt::Display) -> poem::Error {
@@ -208,27 +174,11 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     let query = req.uri().query().unwrap_or("");
     let qm = QueryMap::parse(query);
 
-    // Resolve the tile source. The `pmtiles` query parameter can name an
-    // arbitrary path or URL, which would let an unauthenticated client read
-    // local files or reach internal services (SSRF). It is therefore only
-    // honored when `PMTILES_ALLOW_PARAM` is explicitly enabled; otherwise the
-    // server-configured `PMTILES_URL` is the only source.
-    let (pmtiles, source_from_client) = match qm.get_one("pmtiles") {
-        Some(_) if !allow_pmtiles_param() => {
-            return Err(forbidden(
-                "the 'pmtiles' parameter is disabled; set PMTILES_ALLOW_PARAM=1 to allow it",
-            ));
-        }
-        Some(p) => (p.to_string(), true),
-        None => (
-            configured_pmtiles_url()
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    bad_request("missing 'pmtiles' parameter (and no PMTILES_URL env var set)")
-                })?,
-            false,
-        ),
-    };
+    // The tile source is fixed by the server (`PMTILES_URL`); clients cannot
+    // choose it, which removes any SSRF / local-file-read surface.
+    let pmtiles = configured_pmtiles_url()
+        .map(|s| s.to_string())
+        .ok_or_else(|| internal_error("PMTILES_URL is not configured"))?;
 
     // Short-circuit unchanged renders: if the client already holds this exact
     // output, skip all fetching/rasterization and return 304.
@@ -342,16 +292,9 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         }
     };
 
-    let source = get_source(&pmtiles).await.map_err(|e| {
-        // A client-supplied source that fails to open (bad/unreachable URL) is
-        // a client error, not a server fault — don't log it as a 500.
-        let msg = format!("failed to open pmtiles source: {e}");
-        if source_from_client {
-            bad_request(msg)
-        } else {
-            internal_error(msg)
-        }
-    })?;
+    let source = get_source(&pmtiles)
+        .await
+        .map_err(|e| internal_error(format!("failed to open pmtiles source: {e}")))?;
 
     let covering = viewport.covering_tiles();
     tracing::debug!(
@@ -365,31 +308,42 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     // Fetch tiles concurrently: with a remote PMTiles URL, sequential
     // round-trips would dominate latency. A tile that fails to fetch is skipped
     // rather than failing the whole request.
+    // Each task returns `(tile, had_error)`. `Ok(None)` (a tile that simply
+    // isn't in the archive) is normal and not an error; a fetch/decode failure
+    // is. We still render what we got, but a degraded render must not be cached
+    // long-term (see the cache-header logic below).
     let mut set = tokio::task::JoinSet::new();
     for (z, x, y) in covering {
         let source = source.clone();
         set.spawn(async move {
             match source.get_tile(z, x, y).await {
                 Ok(Some(bytes)) => match tiles::decode_tile(bytes.to_vec()) {
-                    Ok(layers) => Some(((z, x, y), layers)),
+                    Ok(layers) => (Some(((z, x, y), layers)), false),
                     Err(e) => {
                         tracing::warn!(z, x, y, error = %e, "failed to decode tile");
-                        None
+                        (None, true)
                     }
                 },
-                Ok(None) => None,
+                Ok(None) => (None, false),
                 Err(e) => {
                     tracing::warn!(z, x, y, error = %e, "failed to fetch tile");
-                    None
+                    (None, true)
                 }
             }
         });
     }
 
     let mut tiles = Vec::new();
+    let mut had_tile_error = false;
     while let Some(res) = set.join_next().await {
-        if let Ok(Some(tile)) = res {
-            tiles.push(tile);
+        match res {
+            Ok((Some(tile), err)) => {
+                tiles.push(tile);
+                had_tile_error |= err;
+            }
+            Ok((None, err)) => had_tile_error |= err,
+            // A panicked/cancelled fetch task also counts as a degraded render.
+            Err(_) => had_tile_error = true,
         }
     }
     // Restore a deterministic order (JoinSet completes out of order) so tiles
@@ -422,21 +376,32 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
 
     {
         let headers = response.headers_mut();
-        headers.insert("cache-control", CACHE_CONTROL.parse().unwrap());
-        headers.insert("etag", etag.parse().unwrap());
+        if had_tile_error {
+            // A tile fetch/decode failed, so this render may be incomplete —
+            // don't let it be cached long-term with a durable ETag.
+            headers.insert("cache-control", "no-store".parse().unwrap());
+        } else {
+            headers.insert("cache-control", CACHE_CONTROL.parse().unwrap());
+            headers.insert("etag", etag.parse().unwrap());
+        }
     }
 
-    let longest_path = paths.iter().max_by_key(|p| p.points.len());
-    if let Some(p) = longest_path {
-        if p.points.len() >= 2 {
+    // Report the longest route's length (by measured distance, not point count).
+    let longest_meters = paths
+        .iter()
+        .filter(|p| p.points.len() >= 2)
+        .map(|p| {
             let line: LineString<f64> = p.points.iter().map(|(lat, lon)| (*lon, *lat)).collect();
-            // `f64 as u64` saturates (>= 0, NaN -> 0), and `HeaderValue::from`
-            // for an integer is infallible — no string round-trip needed.
-            let meters = Haversine.length(&line).round() as u64;
-            response
-                .headers_mut()
-                .insert("x-route-length-meters", HeaderValue::from(meters));
-        }
+            Haversine.length(&line)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if longest_meters.is_finite() {
+        // `f64 as u64` saturates (>= 0, NaN -> 0), and `HeaderValue::from` for an
+        // integer is infallible — no string round-trip needed.
+        let meters = longest_meters.round() as u64;
+        response
+            .headers_mut()
+            .insert("x-route-length-meters", HeaderValue::from(meters));
     }
 
     Ok(response)

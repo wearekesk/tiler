@@ -77,8 +77,7 @@ startup):
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PMTILES_URL` | — | Default PMTiles source (local path or `http(s)://` URL). Used when a request omits `pmtiles`. |
-| `PMTILES_ALLOW_PARAM` | `false` | Allow requests to select their own source via the `pmtiles` query param. Off by default — it permits arbitrary local-file/URL access (SSRF), so only enable it for trusted deployments. |
+| `PMTILES_URL` | — | The PMTiles source (local path or `http(s)://` URL). **Required.** Fixed server-side; clients cannot choose the source. |
 | `PORT` | `3000` | Port to listen on. |
 | `RUST_LOG` | `info` | Log/trace filter (e.g. `info,tiler=debug`). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | When set, spans are exported to this OTLP/gRPC collector (e.g. `http://localhost:4317`). |
@@ -93,7 +92,6 @@ Output size is capped: `size` is at most `4096x4096`, and the *scaled* output
 | Parameter | Repeatable | Description |
 | --- | --- | --- |
 | `size=WxH` | | **Required.** Output size in pixels (max `4096x4096`). |
-| `pmtiles=PATH_OR_URL` | | PMTiles source; falls back to `PMTILES_URL`. Only honored when `PMTILES_ALLOW_PARAM` is enabled (otherwise `403`). |
 | `center=LAT,LON` & `zoom=Z` | | Viewport center and zoom. If omitted, the viewport auto-fits the points below. |
 | `scale=1\|2\|4` | | Pixel density multiplier (default `1`). |
 | `format=png\|svg` | | Output format (default `png`). |

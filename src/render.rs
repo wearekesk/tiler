@@ -1,20 +1,12 @@
 //! Builds an SVG document from decoded MVT tile geometries, marker pins, and
 //! optional route polylines, and rasterizes it to PNG. Route polylines are
-//! stroked using lyon's tessellator and emitted as a set of filled triangles;
-//! this keeps the rendering path simple at the cost of faint anti-aliasing
-//! seams between adjacent triangles, which is an acceptable trade-off for this
-//! endpoint.
+//! emitted as native stroked `<path>` elements.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 
 use geo_types::{Geometry, LineString, Polygon};
-use lyon::math::point;
-use lyon::path::Path as LyonPath;
-use lyon::tessellation::{
-    BuffersBuilder, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers,
-};
 use mvt_reader::feature::Value;
 use resvg::usvg::fontdb::Database;
 
@@ -718,70 +710,30 @@ fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
     // Colors come from user query parameters; escape before emitting to SVG.
     let color = xml_escape(&spec.color);
 
-    // Optional polygon fill: render the raw point list as a closed ring
-    // first (beneath the stroked line), akin to Google's `fillcolor`.
+    let mut d = String::new();
+    for (i, (lat, lon)) in spec.points.iter().enumerate() {
+        let (x, y) = viewport.project(*lat, *lon);
+        let cmd = if i == 0 { 'M' } else { 'L' };
+        let _ = write!(d, "{cmd} {x:.2} {y:.2} ");
+    }
+    if d.is_empty() {
+        return out;
+    }
+
+    // Optional polygon fill: the point list as a closed ring, beneath the
+    // stroked line (akin to Google's `fillcolor`).
     if let Some(fillcolor) = &spec.fillcolor {
         let fillcolor = xml_escape(fillcolor);
-        let mut d = String::new();
-        for (i, (lat, lon)) in spec.points.iter().enumerate() {
-            let (x, y) = viewport.project(*lat, *lon);
-            if i == 0 {
-                d.push_str(&format!("M {x:.2} {y:.2} "));
-            } else {
-                d.push_str(&format!("L {x:.2} {y:.2} "));
-            }
-        }
-        d.push('Z');
         out.push_str(&format!(
-            "<path d=\"{d}\" fill=\"{fillcolor}\" stroke=\"none\" />\n"
+            "<path d=\"{d}Z\" fill=\"{fillcolor}\" stroke=\"none\" />\n"
         ));
     }
 
-    let mut builder = LyonPath::builder();
-    let mut points = spec.points.iter().map(|(lat, lon)| {
-        let (x, y) = viewport.project(*lat, *lon);
-        point(x as f32, y as f32)
-    });
-
-    if let Some(first) = points.next() {
-        builder.begin(first);
-        for p in points {
-            builder.line_to(p);
-        }
-        builder.end(false);
-    }
-    let path = builder.build();
-
-    // u32 indices: a long/thick route can tessellate to more than u16::MAX
-    // (65535) vertices, which would overflow the index and corrupt the mesh.
-    let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-    let mut tessellator = StrokeTessellator::new();
-    {
-        let mut buffers_builder = BuffersBuilder::new(&mut geometry, |vertex: StrokeVertex| {
-            let p = vertex.position();
-            [p.x, p.y]
-        });
-        let _ = tessellator.tessellate_path(
-            &path,
-            &StrokeOptions::default().with_line_width(spec.weight),
-            &mut buffers_builder,
-        );
-    }
-
-    for tri in geometry.indices.chunks(3) {
-        let (Some(&a), Some(&b), Some(&c)) = (
-            tri.first().and_then(|&i| geometry.vertices.get(i as usize)),
-            tri.get(1).and_then(|&i| geometry.vertices.get(i as usize)),
-            tri.get(2).and_then(|&i| geometry.vertices.get(i as usize)),
-        ) else {
-            continue;
-        };
-        let _ = writeln!(
-            out,
-            "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{color}\" />",
-            a[0], a[1], b[0], b[1], c[0], c[1]
-        );
-    }
+    // The route line, stroked natively by the SVG renderer (no tessellation).
+    out.push_str(&format!(
+        "<path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+        spec.weight
+    ));
     out
 }
 

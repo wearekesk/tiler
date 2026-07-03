@@ -196,7 +196,7 @@ impl Viewport {
             for i in 0..cols {
                 let tx = x0 + i;
                 // Wrap tile X around the antimeridian.
-                let wrapped = ((tx % tiles_per_axis) + tiles_per_axis) % tiles_per_axis;
+                let wrapped = tx.rem_euclid(tiles_per_axis);
                 tiles.push((self.zoom, wrapped as u32, ty as u32));
             }
         }
