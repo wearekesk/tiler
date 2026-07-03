@@ -2,7 +2,7 @@
 //! Static API), backed by a PMTiles vector tile archive.
 //!
 //! `GET /staticmap?size=WxH
-//!      [&center=LAT,LON&zoom=Z][&scale=1|2|4][&format=png|svg]
+//!      [&center=LAT,LON&zoom=Z][&scale=1|2|4][&format=png|svg|jpeg]
 //!      [&markers=[color:C|label:L|size:S|]LAT,LON|LAT,LON..]* (repeatable)
 //!      [&path=[color:C|weight:W|fillcolor:C|]LAT,LON|LAT,LON..|enc:POLYLINE]* (repeatable)
 //!      [&style=feature:F|color:C|weight:W]* (repeatable)
@@ -225,10 +225,10 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     }
 
     let format = match qm.get_one("format").unwrap_or("png") {
-        f @ ("png" | "svg") => f.to_string(),
+        f @ ("png" | "svg" | "jpeg" | "jpg") => f.to_string(),
         other => {
             return Err(bad_request(format!(
-                "invalid format '{other}': expected 'png' or 'svg'"
+                "invalid format '{other}': expected 'png', 'svg', or 'jpeg'"
             )))
         }
     };
@@ -350,29 +350,50 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     // composite identically across requests.
     tiles.sort_by_key(|((z, x, y), _)| (*z, *x, *y));
 
-    let svg = render_svg(
-        &viewport,
-        &tiles,
-        &overrides,
-        &marker_groups,
-        &paths,
-        out_width,
-        out_height,
-    );
+    // Compute the longest route's length (by measured distance) before `paths`
+    // is moved into the render task below.
+    let longest_meters = paths
+        .iter()
+        .filter(|p| p.points.len() >= 2)
+        .map(|p| {
+            let line: LineString<f64> = p.points.iter().map(|(lat, lon)| (*lon, *lat)).collect();
+            Haversine.length(&line)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
 
-    let mut response = if format == "svg" {
-        Response::builder().content_type("image/svg+xml").body(svg)
-    } else {
-        // Rasterization is CPU-bound (SVG parse + render up to 8192x8192); run
-        // it on the blocking pool so it doesn't stall the async worker thread
-        // and starve other in-flight requests.
-        let png =
-            tokio::task::spawn_blocking(move || render::svg_to_png(&svg, out_width, out_height))
-                .await
-                .map_err(|e| internal_error(format!("rasterization task panicked: {e}")))?
-                .map_err(|e| internal_error(format!("failed to rasterize png: {e}")))?;
-        Response::builder().content_type("image/png").body(png)
-    };
+    // Rendering the SVG and rasterizing it are both CPU-bound (many tiles, up to
+    // an 8192x8192 pixmap). Do all of it on the blocking pool so the async
+    // worker thread stays free, and so the large SVG string never crosses a
+    // thread boundary.
+    let (bytes, content_type) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let svg = render_svg(
+            &viewport,
+            &tiles,
+            &overrides,
+            &marker_groups,
+            &paths,
+            out_width,
+            out_height,
+        );
+        let out: (Vec<u8>, &'static str) = match format.as_str() {
+            "svg" => (svg.into_bytes(), "image/svg+xml"),
+            // Quality 85: a good size/quality balance for map imagery.
+            "jpeg" | "jpg" => (
+                render::svg_to_jpeg(&svg, out_width, out_height, 85)?,
+                "image/jpeg",
+            ),
+            _ => (
+                render::svg_to_png(&svg, out_width, out_height)?,
+                "image/png",
+            ),
+        };
+        Ok(out)
+    })
+    .await
+    .map_err(|e| internal_error(format!("render task panicked: {e}")))?
+    .map_err(|e| internal_error(format!("failed to render image: {e}")))?;
+
+    let mut response = Response::builder().content_type(content_type).body(bytes);
 
     {
         let headers = response.headers_mut();
@@ -386,15 +407,6 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         }
     }
 
-    // Report the longest route's length (by measured distance, not point count).
-    let longest_meters = paths
-        .iter()
-        .filter(|p| p.points.len() >= 2)
-        .map(|p| {
-            let line: LineString<f64> = p.points.iter().map(|(lat, lon)| (*lon, *lat)).collect();
-            Haversine.length(&line)
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
     if longest_meters.is_finite() {
         // `f64 as u64` saturates (>= 0, NaN -> 0), and `HeaderValue::from` for an
         // integer is infallible — no string round-trip needed.

@@ -58,6 +58,11 @@ pub fn render_svg(
     // casings under all fills). (rank, casing_svg, fill_svg).
     let mut road_segments: Vec<(i32, Option<String>, String)> = Vec::new();
 
+    // The seal stroke that hides tile-boundary AA gaps is specified in viewBox
+    // units; scale it so it's ~1 pixel in the *rasterized* output regardless of
+    // `scale`, otherwise it fattens to 2-4px on HiDPI renders.
+    let seal_width = (viewport.width as f64 / out_width.max(1) as f64).max(0.01);
+
     // Render layer-major (painter's algorithm) across *all* tiles: everything
     // is drawn into a per-z-level bucket, then the buckets are concatenated
     // bottom-to-top. This is essential for seamless tiling - drawing
@@ -197,7 +202,7 @@ pub fn render_svg(
                             // anti-aliased edges overlap instead of leaving a
                             // hairline seam.
                             levels[zi].push_str(&format!(
-                                "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"{fill}\" stroke-width=\"1\" />\n",
+                                "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"{fill}\" stroke-width=\"{seal_width:.3}\" />\n",
                             ));
                         }
                     } else if let Some(stroke) = stroke.as_deref() {
@@ -764,8 +769,8 @@ pub fn warm_fontdb() {
     let _ = shared_fontdb();
 }
 
-/// Rasterizes an SVG document to PNG bytes using resvg/usvg/tiny-skia.
-pub fn svg_to_png(svg: &str, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+/// Rasterizes an SVG document to an RGBA pixmap using resvg/usvg/tiny-skia.
+fn rasterize(svg: &str, width: u32, height: u32) -> anyhow::Result<resvg::tiny_skia::Pixmap> {
     let opt = resvg::usvg::Options {
         fontdb: shared_fontdb(),
         font_family: FONT_FAMILY.to_string(),
@@ -781,8 +786,35 @@ pub fn svg_to_png(svg: &str, width: u32, height: u32) -> anyhow::Result<Vec<u8>>
         resvg::tiny_skia::Transform::default(),
         &mut pixmap.as_mut(),
     );
+    Ok(pixmap)
+}
 
-    pixmap
+/// Rasterizes an SVG document to PNG bytes.
+pub fn svg_to_png(svg: &str, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+    rasterize(svg, width, height)?
         .encode_png()
         .map_err(|e| anyhow::anyhow!("failed to encode png: {e}"))
+}
+
+/// Rasterizes an SVG document to JPEG bytes at the given quality (0-100). JPEG
+/// has no alpha; the map is fully opaque over its background rect, so the RGB
+/// channels are used directly.
+pub fn svg_to_jpeg(svg: &str, width: u32, height: u32, quality: u8) -> anyhow::Result<Vec<u8>> {
+    let pixmap = rasterize(svg, width, height)?;
+    let rgb: Vec<u8> = pixmap
+        .data()
+        .chunks_exact(4)
+        .flat_map(|px| [px[0], px[1], px[2]])
+        .collect();
+
+    let mut buf = Vec::new();
+    jpeg_encoder::Encoder::new(&mut buf, quality)
+        .encode(
+            &rgb,
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to encode jpeg: {e}"))?;
+    Ok(buf)
 }

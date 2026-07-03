@@ -93,8 +93,8 @@ Output size is capped: `size` is at most `4096x4096`, and the *scaled* output
 | --- | --- | --- |
 | `size=WxH` | | **Required.** Output size in pixels (max `4096x4096`). |
 | `center=LAT,LON` & `zoom=Z` | | Viewport center and zoom. If omitted, the viewport auto-fits the points below. |
-| `scale=1\|2\|4` | | Pixel density multiplier (default `1`). |
-| `format=png\|svg` | | Output format (default `png`). |
+| `scale=1\|2\|4` | | Pixel-density multiplier (default `1`). **Use `scale=2` on HiDPI/Retina** — a `scale=1` raster is upscaled by the browser and looks soft, while `svg` stays crisp because it's vector. |
+| `format=png\|svg\|jpeg` | | Output format (default `png`). `jpeg` (alias `jpg`) is much smaller than PNG; `svg` is vector (crispest). |
 | `markers=[color:C\|label:L\|size:S\|]LAT,LON\|…` | ✓ | A marker group. `size` is `tiny\|small\|mid`. |
 | `path=[color:C\|weight:W\|fillcolor:C\|]LAT,LON\|…` | ✓ | A route path. Accepts `enc:<polyline>` instead of coordinate pairs. |
 | `style=feature:F\|color:C\|weight:W` | ✓ | Override a feature bucket's color/weight. `F` is one of `earth,landuse,water,waterway,building,road,transit,boundary,other`, or `all`. |

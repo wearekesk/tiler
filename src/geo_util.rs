@@ -25,11 +25,6 @@ pub fn lat_to_frac(lat: f64) -> f64 {
     0.5 - ((1.0 + lat_rad.sin()) / (1.0 - lat_rad.sin())).ln() / (4.0 * std::f64::consts::PI)
 }
 
-/// Inverse of [`lon_to_frac`].
-pub fn frac_to_lon(frac: f64) -> f64 {
-    frac * 360.0 - 180.0
-}
-
 /// Inverse of [`lat_to_frac`].
 pub fn frac_to_lat(frac: f64) -> f64 {
     let n = std::f64::consts::PI * (1.0 - 2.0 * frac);
@@ -54,10 +49,17 @@ pub fn center_of(points: &[(f64, f64)]) -> (f64, f64) {
     }
     let min_lat = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
     let max_lat = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-    let min_lon = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let max_lon = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
     let center_lat = frac_to_lat((lat_to_frac(min_lat) + lat_to_frac(max_lat)) / 2.0);
-    let center_lon = frac_to_lon((lon_to_frac(min_lon) + lon_to_frac(max_lon)) / 2.0);
+
+    // Circular mean for longitude, so a cluster straddling the antimeridian
+    // (e.g. -179° and 179°) centers at ±180°, not 0°.
+    let (mut xs, mut ys) = (0.0f64, 0.0f64);
+    for &(_, lon) in points {
+        let r = lon.to_radians();
+        xs += r.cos();
+        ys += r.sin();
+    }
+    let center_lon = ys.atan2(xs).to_degrees();
     (center_lat, center_lon)
 }
 
@@ -91,35 +93,14 @@ impl Viewport {
     /// Mirrors the Google Static Maps `visible` parameter's auto-fit
     /// behavior. Falls back to zoom 1 if `points` is empty.
     pub fn fit(points: &[(f64, f64)], width: u32, height: u32) -> Self {
-        const MAX_ZOOM: u8 = 17;
-        const PADDING_PX: f64 = 32.0;
-
         if points.is_empty() {
             return Viewport::new(0.0, 0.0, 1, width, height);
         }
-
-        let min_lat = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-        let max_lat = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-        let min_lon = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-        let max_lon = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-
+        // Center on the points (circular-mean longitude), then reuse the
+        // antimeridian-safe zoom fit. This keeps a single span calculation and
+        // avoids the raw max-min longitude span, which is wrong across ±180°.
         let (center_lat, center_lon) = center_of(points);
-
-        let lon_frac_span = (lon_to_frac(max_lon) - lon_to_frac(min_lon)).abs();
-        let lat_frac_span = (lat_to_frac(min_lat) - lat_to_frac(max_lat)).abs();
-
-        let mut zoom = MAX_ZOOM;
-        while zoom > 0 {
-            let scale = tile_size_at_zoom(zoom);
-            let w = lon_frac_span * scale + PADDING_PX * 2.0;
-            let h = lat_frac_span * scale + PADDING_PX * 2.0;
-            if w <= width as f64 && h <= height as f64 {
-                break;
-            }
-            zoom -= 1;
-        }
-
-        Viewport::new(center_lat, center_lon, zoom, width, height)
+        Viewport::fit_at_center(center_lat, center_lon, points, width, height)
     }
 
     /// Keeps a fixed `center` and picks the largest zoom at which every point
