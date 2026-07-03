@@ -338,12 +338,17 @@ fn append_polygon(d: &mut String, poly: &Polygon<f32>, scale: f64, ox: f64, oy: 
 }
 
 fn append_ring(d: &mut String, ring: &LineString<f32>, scale: f64, ox: f64, oy: f64) {
+    let mut any = false;
     for (i, c) in ring.coords().enumerate() {
         let (x, y) = tp(c.x, c.y, scale, ox, oy);
         let cmd = if i == 0 { 'M' } else { 'L' };
         let _ = write!(d, "{cmd} {x:.2} {y:.2} ");
+        any = true;
     }
-    d.push_str("Z ");
+    // Don't emit a bare `Z` for an empty ring — that's malformed path data.
+    if any {
+        d.push_str("Z ");
+    }
 }
 
 /// A placed-or-not label with the data needed to declutter it.
