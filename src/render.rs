@@ -6,6 +6,7 @@
 //! endpoint.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 
 use geo_types::{Geometry, LineString, Polygon};
@@ -26,11 +27,18 @@ use crate::tiles::DecodedLayer;
 pub type DecodedTile = ((u8, u32, u32), Vec<DecodedLayer>);
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -317,11 +325,8 @@ fn geometry_to_path(geom: &Geometry<f32>, scale: f64, ox: f64, oy: f64) -> Optio
 fn append_line(d: &mut String, ls: &LineString<f32>, scale: f64, ox: f64, oy: f64) {
     for (i, c) in ls.coords().enumerate() {
         let (x, y) = tp(c.x, c.y, scale, ox, oy);
-        if i == 0 {
-            d.push_str(&format!("M {x:.2} {y:.2} "));
-        } else {
-            d.push_str(&format!("L {x:.2} {y:.2} "));
-        }
+        let cmd = if i == 0 { 'M' } else { 'L' };
+        let _ = write!(d, "{cmd} {x:.2} {y:.2} ");
     }
 }
 
@@ -335,11 +340,8 @@ fn append_polygon(d: &mut String, poly: &Polygon<f32>, scale: f64, ox: f64, oy: 
 fn append_ring(d: &mut String, ring: &LineString<f32>, scale: f64, ox: f64, oy: f64) {
     for (i, c) in ring.coords().enumerate() {
         let (x, y) = tp(c.x, c.y, scale, ox, oy);
-        if i == 0 {
-            d.push_str(&format!("M {x:.2} {y:.2} "));
-        } else {
-            d.push_str(&format!("L {x:.2} {y:.2} "));
-        }
+        let cmd = if i == 0 { 'M' } else { 'L' };
+        let _ = write!(d, "{cmd} {x:.2} {y:.2} ");
     }
     d.push_str("Z ");
 }
@@ -476,10 +478,8 @@ fn label_for_feature(
     // Anchor: a point's position, or the midpoint vertex of a line (so rivers
     // etc. get a label roughly along their course).
     let midpoint = |ls: &LineString<f32>| -> Option<(f64, f64)> {
-        let coords: Vec<_> = ls.coords().collect();
-        coords
-            .get(coords.len() / 2)
-            .map(|c| tp(c.x, c.y, scale, ox, oy))
+        let n = ls.coords().count();
+        ls.coords().nth(n / 2).map(|c| tp(c.x, c.y, scale, ox, oy))
     };
     let (x, y) = match &feature.geometry {
         Geometry::Point(p) => tp(p.x(), p.y(), scale, ox, oy),
@@ -759,10 +759,11 @@ fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
         ) else {
             continue;
         };
-        out.push_str(&format!(
-            "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{color}\" />\n",
+        let _ = writeln!(
+            out,
+            "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{color}\" />",
             a[0], a[1], b[0], b[1], c[0], c[1]
-        ));
+        );
     }
     out
 }

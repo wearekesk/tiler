@@ -163,7 +163,11 @@ async fn get_source(pmtiles: &str) -> anyhow::Result<Arc<TileSource>> {
     let opened = Arc::new(TileSource::open(pmtiles).await?);
     let mut map = cache.lock().unwrap();
     if !map.contains_key(pmtiles) && map.len() >= MAX_CACHED_SOURCES {
-        if let Some(evict) = map.keys().next().cloned() {
+        // Never evict the server-configured default source, so a flood of unique
+        // client-supplied sources can't force slow re-opens of the common one.
+        let default = configured_pmtiles_url();
+        let victim = map.keys().find(|k| Some(k.as_str()) != default).cloned();
+        if let Some(evict) = victim {
             map.remove(&evict);
         }
     }

@@ -146,7 +146,10 @@ impl Viewport {
         let mut hx = 0.0f64;
         let mut hy = 0.0f64;
         for &(lat, lon) in points {
-            hx = hx.max((lon_to_frac(lon) - cfx).abs());
+            // Use the shorter distance around the world so points just across
+            // the antimeridian from a near-±180° center don't look ~1 world away.
+            let raw = (lon_to_frac(lon) - cfx).abs();
+            hx = hx.max(raw.min(1.0 - raw));
             hy = hy.max((lat_to_frac(lat) - cfy).abs());
         }
 

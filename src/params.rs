@@ -123,17 +123,18 @@ pub fn parse_marker_group(raw: &str) -> poem::Result<MarkerGroup> {
             continue;
         }
         if let Some((key, value)) = token.split_once(':') {
-            match key.to_lowercase().as_str() {
-                "color" => color = normalize_color(value),
-                "label" => label = value.chars().next().map(|c| c.to_ascii_uppercase()),
-                "size" => {
-                    size = match value.to_lowercase().as_str() {
-                        "tiny" => MarkerSize::Tiny,
-                        "small" => MarkerSize::Small,
-                        _ => MarkerSize::Mid,
-                    }
-                }
-                _ => {}
+            if key.eq_ignore_ascii_case("color") {
+                color = normalize_color(value);
+            } else if key.eq_ignore_ascii_case("label") {
+                label = value.chars().next().map(|c| c.to_ascii_uppercase());
+            } else if key.eq_ignore_ascii_case("size") {
+                size = if value.eq_ignore_ascii_case("tiny") {
+                    MarkerSize::Tiny
+                } else if value.eq_ignore_ascii_case("small") {
+                    MarkerSize::Small
+                } else {
+                    MarkerSize::Mid
+                };
             }
         } else {
             points.push(parse_latlon(token)?);
@@ -181,15 +182,15 @@ pub fn parse_path_spec(raw: &str) -> poem::Result<PathSpec> {
             continue;
         }
         if let Some((key, value)) = token.split_once(':') {
-            match key.to_lowercase().as_str() {
-                "color" => color = normalize_color(value),
-                "weight" => weight = parse_weight(value, "path weight")?,
-                "fillcolor" => fillcolor = Some(normalize_color(value)),
-                // `geodesic` is accepted but has no effect: our paths are
-                // already rendered as straight segments in projected space.
-                "geodesic" => {}
-                _ => {}
+            if key.eq_ignore_ascii_case("color") {
+                color = normalize_color(value);
+            } else if key.eq_ignore_ascii_case("weight") {
+                weight = parse_weight(value, "path weight")?;
+            } else if key.eq_ignore_ascii_case("fillcolor") {
+                fillcolor = Some(normalize_color(value));
             }
+            // `geodesic` is accepted but has no effect: our paths are already
+            // rendered as straight segments in projected space.
         } else {
             points.push(parse_latlon(token)?);
         }
@@ -243,11 +244,12 @@ pub fn parse_style_override(raw: &str) -> poem::Result<(String, StyleOverride)> 
             continue;
         }
         if let Some((key, value)) = token.split_once(':') {
-            match key.to_lowercase().as_str() {
-                "feature" => feature = value.to_lowercase(),
-                "color" => over.color = Some(normalize_color(value)),
-                "weight" => over.weight = Some(parse_weight(value, "style weight")?),
-                _ => {}
+            if key.eq_ignore_ascii_case("feature") {
+                feature = value.to_lowercase();
+            } else if key.eq_ignore_ascii_case("color") {
+                over.color = Some(normalize_color(value));
+            } else if key.eq_ignore_ascii_case("weight") {
+                over.weight = Some(parse_weight(value, "style weight")?);
             }
         }
     }
