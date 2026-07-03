@@ -105,6 +105,10 @@ pub fn render_svg(
             let fill = style.fill.as_deref().map(xml_escape);
             let stroke = style.stroke.as_deref().map(xml_escape);
             let casing = style.casing.as_deref().map(xml_escape);
+            // Per-feature road styling bypasses the generic bucket, so resolve
+            // any user `style` override for roads (feature:road or feature:all)
+            // here and apply it to each road segment below.
+            let road_override = overrides.get("road").or_else(|| overrides.get("all"));
 
             for feature in &layer.features {
                 // Collect a label for named features (points, or lines labeled
@@ -147,10 +151,18 @@ pub fn render_svg(
                                     _ => None,
                                 });
                         let rs = road_style(kind, detail);
+                        // Apply a user `style` override, if any. The override
+                        // color is user input, so it must be escaped; the
+                        // built-in class colors are constants and safe.
+                        let road_color = match road_override.and_then(|o| o.color.as_deref()) {
+                            Some(c) => xml_escape(c),
+                            None => rs.color.to_string(),
+                        };
+                        let road_width = road_override.and_then(|o| o.weight).unwrap_or(rs.width);
                         let casing_svg = rs.casing.map(|cc| {
                             format!(
                                 "<path d=\"{path_d}\" fill=\"none\" stroke=\"{cc}\" stroke-width=\"{:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
-                                rs.width + rs.casing_extra
+                                road_width + rs.casing_extra
                             )
                         });
                         let dash = rs
@@ -158,8 +170,8 @@ pub fn render_svg(
                             .map(|d| format!(" stroke-dasharray=\"{d}\""))
                             .unwrap_or_default();
                         let fill_svg = format!(
-                            "<path d=\"{path_d}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\"{dash} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
-                            rs.color, rs.width
+                            "<path d=\"{path_d}\" fill=\"none\" stroke=\"{road_color}\" stroke-width=\"{:.1}\"{dash} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                            road_width
                         );
                         road_segments.push((rs.rank, casing_svg, fill_svg));
                     }
