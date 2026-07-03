@@ -53,6 +53,10 @@ pub fn render_svg(
     // Candidate labels are collected first, then placed after all tiles are
     // processed so we can declutter (drop overlapping ones) by priority.
     let mut label_candidates: Vec<LabelCandidate> = Vec::new();
+    // Roads are styled per-feature by class and collected across all tiles, then
+    // emitted sorted by rank so major roads draw over minor ones (and all
+    // casings under all fills). (rank, casing_svg, fill_svg).
+    let mut road_segments: Vec<(i32, Option<String>, String)> = Vec::new();
 
     // Render layer-major (painter's algorithm) across *all* tiles: everything
     // is drawn into a per-z-level bucket, then the buckets are concatenated
@@ -82,6 +86,10 @@ pub fn render_svg(
                 let n = layer.name.to_lowercase();
                 n.contains("place") || n.contains("water") || n.contains("physical")
             };
+            let is_road_layer = {
+                let n = layer.name.to_lowercase();
+                n.contains("road") || n.contains("transportation") || n.contains("highway")
+            };
 
             // Colors can originate from user-supplied `style` overrides, so
             // escape them (once per layer) before they reach the SVG to avoid
@@ -106,6 +114,48 @@ pub fn render_svg(
                             label_candidates.push(c);
                         }
                     }
+                }
+
+                // Roads are drawn per-feature by class (width/color/casing),
+                // collected for later rank-sorted emission — not via the generic
+                // path below.
+                if is_road_layer {
+                    if let Some(path_d) =
+                        geometry_to_path(&feature.geometry, scale, offset_x, offset_y)
+                    {
+                        let kind = feature
+                            .properties
+                            .as_ref()
+                            .and_then(|p| match p.get("kind") {
+                                Some(Value::String(s)) => Some(s.as_str()),
+                                _ => None,
+                            });
+                        let detail =
+                            feature
+                                .properties
+                                .as_ref()
+                                .and_then(|p| match p.get("kind_detail") {
+                                    Some(Value::String(s)) => Some(s.as_str()),
+                                    _ => None,
+                                });
+                        let rs = road_style(kind, detail);
+                        let casing_svg = rs.casing.map(|cc| {
+                            format!(
+                                "<path d=\"{path_d}\" fill=\"none\" stroke=\"{cc}\" stroke-width=\"{:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                                rs.width + rs.casing_extra
+                            )
+                        });
+                        let dash = rs
+                            .dash
+                            .map(|d| format!(" stroke-dasharray=\"{d}\""))
+                            .unwrap_or_default();
+                        let fill_svg = format!(
+                            "<path d=\"{path_d}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\"{dash} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                            rs.color, rs.width
+                        );
+                        road_segments.push((rs.rank, casing_svg, fill_svg));
+                    }
+                    continue;
                 }
 
                 if let Some(path_d) = geometry_to_path(&feature.geometry, scale, offset_x, offset_y)
@@ -157,6 +207,21 @@ pub fn render_svg(
         }
     }
 
+    // Emit roads: all casings first, then all fills, each in ascending rank so
+    // motorways draw over residential streets. Road z-levels mirror the `road`
+    // bucket in `style.rs` (fill z=8, casing z=7).
+    const ROAD_CASING_Z: usize = 7;
+    const ROAD_FILL_Z: usize = 8;
+    road_segments.sort_by_key(|s| s.0);
+    for (_, casing, _) in &road_segments {
+        if let Some(c) = casing {
+            levels[ROAD_CASING_Z].push_str(c);
+        }
+    }
+    for (_, _, fill) in &road_segments {
+        levels[ROAD_FILL_Z].push_str(fill);
+    }
+
     // Declutter labels: place the most important first (lowest priority value
     // = highest rank), and skip any whose box overlaps an already-placed label.
     // This is what keeps low zooms readable instead of a wall of overlapping
@@ -202,8 +267,8 @@ pub fn render_svg(
     let h = viewport.height;
     let notice = format!("&#169; Kesk Systems O&#220; {}", current_year());
     let attribution = format!(
-        "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"10\" font-family=\"sans-serif\" text-anchor=\"end\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"2.5\" paint-order=\"stroke\">{notice}</text>\n\
-         <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"10\" font-family=\"sans-serif\" text-anchor=\"end\" fill=\"#5f5f5f\">{notice}</text>\n",
+        "<text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"10\" font-family=\"Roboto, sans-serif\" text-anchor=\"end\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"2.5\" paint-order=\"stroke\">{notice}</text>\n\
+         <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"10\" font-family=\"Roboto, sans-serif\" text-anchor=\"end\" fill=\"#5f5f5f\">{notice}</text>\n",
         x = w as f64 - 5.0,
         y = h as f64 - 5.0,
     );
@@ -451,7 +516,7 @@ fn label_for_feature(
     };
     let escaped = xml_escape(&display);
     let style_attrs = format!(
-        "font-size=\"{size:.1}\" font-family=\"sans-serif\" font-weight=\"{weight}\"{italic}{tracking} text-anchor=\"middle\"",
+        "font-size=\"{size:.1}\" font-family=\"Roboto, sans-serif\" font-weight=\"{weight}\"{italic}{tracking} text-anchor=\"middle\"",
         size = font_size,
         weight = ls.weight,
         italic = if ls.italic { " font-style=\"italic\"" } else { "" },
@@ -476,6 +541,127 @@ fn label_for_feature(
     })
 }
 
+/// Per-class road styling. Colors are constant (from the data, not user input),
+/// so they need no escaping.
+struct RoadStyle {
+    color: &'static str,
+    width: f32,
+    /// Casing (outline) color, drawn `casing_extra` px wider beneath the fill.
+    casing: Option<&'static str>,
+    casing_extra: f32,
+    dash: Option<&'static str>,
+    /// Draw order among roads; higher renders on top.
+    rank: i32,
+}
+
+/// Maps a road feature's `kind`/`kind_detail` to a Google-like style: orange
+/// motorways, white arterials that get thinner down the hierarchy, thin service
+/// roads, faint dashed paths, and dashed rail/ferry lines.
+fn road_style(kind: Option<&str>, detail: Option<&str>) -> RoadStyle {
+    const WHITE: &str = "#ffffff";
+    const CASING: &str = "#d5dde3";
+    const MOTORWAY: &str = "#f6b25a";
+    const MOTORWAY_CASING: &str = "#e0912f";
+    match (kind, detail) {
+        (Some("highway"), Some("motorway")) => RoadStyle {
+            color: MOTORWAY,
+            width: 3.4,
+            casing: Some(MOTORWAY_CASING),
+            casing_extra: 1.6,
+            dash: None,
+            rank: 100,
+        },
+        (Some("highway"), _) => RoadStyle {
+            color: MOTORWAY,
+            width: 2.4,
+            casing: Some(MOTORWAY_CASING),
+            casing_extra: 1.4,
+            dash: None,
+            rank: 92,
+        },
+        (Some("major_road"), Some("trunk")) => RoadStyle {
+            color: WHITE,
+            width: 2.8,
+            casing: Some(CASING),
+            casing_extra: 1.6,
+            dash: None,
+            rank: 80,
+        },
+        (Some("major_road"), Some("primary") | Some("primary_link")) => RoadStyle {
+            color: WHITE,
+            width: 2.6,
+            casing: Some(CASING),
+            casing_extra: 1.5,
+            dash: None,
+            rank: 72,
+        },
+        (Some("major_road"), Some("secondary") | Some("secondary_link")) => RoadStyle {
+            color: WHITE,
+            width: 2.1,
+            casing: Some(CASING),
+            casing_extra: 1.4,
+            dash: None,
+            rank: 64,
+        },
+        (Some("major_road"), _) => RoadStyle {
+            color: WHITE,
+            width: 1.8,
+            casing: Some(CASING),
+            casing_extra: 1.3,
+            dash: None,
+            rank: 56,
+        },
+        (Some("minor_road"), Some("service")) => RoadStyle {
+            color: WHITE,
+            width: 1.0,
+            casing: Some(CASING),
+            casing_extra: 1.0,
+            dash: None,
+            rank: 30,
+        },
+        (Some("minor_road"), _) => RoadStyle {
+            color: WHITE,
+            width: 1.4,
+            casing: Some(CASING),
+            casing_extra: 1.1,
+            dash: None,
+            rank: 36,
+        },
+        (Some("path"), _) => RoadStyle {
+            color: "#c8ccd2",
+            width: 0.9,
+            casing: None,
+            casing_extra: 0.0,
+            dash: Some("1,2.5"),
+            rank: 12,
+        },
+        (Some("rail"), _) => RoadStyle {
+            color: "#c2c7cf",
+            width: 0.9,
+            casing: None,
+            casing_extra: 0.0,
+            dash: Some("4,3"),
+            rank: 16,
+        },
+        (Some("ferry"), _) => RoadStyle {
+            color: "#8fbfe0",
+            width: 1.1,
+            casing: None,
+            casing_extra: 0.0,
+            dash: Some("2,4"),
+            rank: 14,
+        },
+        _ => RoadStyle {
+            color: WHITE,
+            width: 1.4,
+            casing: Some(CASING),
+            casing_extra: 1.1,
+            dash: None,
+            rank: 34,
+        },
+    }
+}
+
 fn render_marker_group(viewport: &Viewport, group: &MarkerGroup) -> String {
     let mut out = String::new();
     // Head radius of the teardrop pin; the tip sits exactly on the location.
@@ -496,7 +682,7 @@ fn render_marker_group(viewport: &Viewport, group: &MarkerGroup) -> String {
         ));
         if let Some(label) = &label {
             out.push_str(&format!(
-                "<text x=\"{mx:.2}\" y=\"{cy:.2}\" font-size=\"{:.1}\" font-family=\"sans-serif\" font-weight=\"700\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#ffffff\">{label}</text>\n",
+                "<text x=\"{mx:.2}\" y=\"{cy:.2}\" font-size=\"{:.1}\" font-family=\"Roboto, sans-serif\" font-weight=\"700\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#ffffff\">{label}</text>\n",
                 hr * 1.15
             ));
         } else {
@@ -581,12 +767,21 @@ fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
     out
 }
 
-/// Loads system fonts once per process and caches the resulting database,
-/// since scanning installed fonts on every request would be wasteful.
+/// The label font family. Roboto is bundled (below), so this renders
+/// identically everywhere — matching Google Maps, which also uses Roboto.
+const FONT_FAMILY: &str = "Roboto";
+
+/// Loads the font database once per process and caches it. Roboto is embedded
+/// in the binary so text renders consistently (including in the container);
+/// system fonts are also loaded as a fallback for any missing glyphs.
 fn shared_fontdb() -> Arc<Database> {
     static DB: OnceLock<Arc<Database>> = OnceLock::new();
     DB.get_or_init(|| {
         let mut db = Database::new();
+        db.load_font_data(include_bytes!("../assets/fonts/Roboto-Regular.ttf").to_vec());
+        db.load_font_data(include_bytes!("../assets/fonts/Roboto-Medium.ttf").to_vec());
+        db.load_font_data(include_bytes!("../assets/fonts/Roboto-Bold.ttf").to_vec());
+        db.load_font_data(include_bytes!("../assets/fonts/Roboto-Italic.ttf").to_vec());
         db.load_system_fonts();
         Arc::new(db)
     })
@@ -603,7 +798,7 @@ pub fn warm_fontdb() {
 pub fn svg_to_png(svg: &str, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
     let opt = resvg::usvg::Options {
         fontdb: shared_fontdb(),
-        font_family: "Arial".to_string(),
+        font_family: FONT_FAMILY.to_string(),
         ..Default::default()
     };
     let tree = resvg::usvg::Tree::from_str(svg, &opt)?;

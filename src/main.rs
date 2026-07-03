@@ -121,6 +121,19 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the `pmtiles` query parameter is honored. Read once (static config).
+fn allow_pmtiles_param() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| env_flag("PMTILES_ALLOW_PARAM"))
+}
+
+/// The server-configured default source. Read once (static config).
+fn configured_pmtiles_url() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| std::env::var("PMTILES_URL").ok())
+        .as_deref()
+}
+
 /// Process-wide cache of opened tile sources, keyed by source string.
 /// Opening a PMTiles archive reads its header + root directory (a network
 /// round-trip for remote URLs), and the reader is thread-safe and reusable
@@ -197,16 +210,18 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
     // honored when `PMTILES_ALLOW_PARAM` is explicitly enabled; otherwise the
     // server-configured `PMTILES_URL` is the only source.
     let (pmtiles, source_from_client) = match qm.get_one("pmtiles") {
-        Some(_) if !env_flag("PMTILES_ALLOW_PARAM") => {
+        Some(_) if !allow_pmtiles_param() => {
             return Err(forbidden(
                 "the 'pmtiles' parameter is disabled; set PMTILES_ALLOW_PARAM=1 to allow it",
             ));
         }
         Some(p) => (p.to_string(), true),
         None => (
-            std::env::var("PMTILES_URL").ok().ok_or_else(|| {
-                bad_request("missing 'pmtiles' parameter (and no PMTILES_URL env var set)")
-            })?,
+            configured_pmtiles_url()
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    bad_request("missing 'pmtiles' parameter (and no PMTILES_URL env var set)")
+                })?,
             false,
         ),
     };
@@ -313,6 +328,11 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
                     let (lat, lon) = geo_util::center_of(&fit_points);
                     Viewport::new(lat, lon, z, width, height)
                 }
+                // `center` given but no `zoom`: keep the requested center and
+                // only auto-fit the zoom so all points are visible.
+                (Some((lat, lon)), None) => {
+                    Viewport::fit_at_center(lat, lon, &fit_points, width, height)
+                }
                 _ => Viewport::fit(&fit_points, width, height),
             }
         }
@@ -346,9 +366,13 @@ async fn static_map(req: &Request) -> poem::Result<Response> {
         let source = source.clone();
         set.spawn(async move {
             match source.get_tile(z, x, y).await {
-                Ok(Some(bytes)) => tiles::decode_tile(bytes.to_vec())
-                    .ok()
-                    .map(|layers| ((z, x, y), layers)),
+                Ok(Some(bytes)) => match tiles::decode_tile(bytes.to_vec()) {
+                    Ok(layers) => Some(((z, x, y), layers)),
+                    Err(e) => {
+                        tracing::warn!(z, x, y, error = %e, "failed to decode tile");
+                        None
+                    }
+                },
                 Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(z, x, y, error = %e, "failed to fetch tile");

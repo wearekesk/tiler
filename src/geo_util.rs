@@ -122,6 +122,48 @@ impl Viewport {
         Viewport::new(center_lat, center_lon, zoom, width, height)
     }
 
+    /// Keeps a fixed `center` and picks the largest zoom at which every point
+    /// still fits (with a small margin). Used when the caller supplies `center`
+    /// but not `zoom`: unlike [`Viewport::fit`], the center is respected.
+    pub fn fit_at_center(
+        center_lat: f64,
+        center_lon: f64,
+        points: &[(f64, f64)],
+        width: u32,
+        height: u32,
+    ) -> Self {
+        const MAX_ZOOM: u8 = 17;
+        const PADDING_PX: f64 = 32.0;
+
+        if points.is_empty() {
+            return Viewport::new(center_lat, center_lon, 1, width, height);
+        }
+
+        let cfx = lon_to_frac(center_lon);
+        let cfy = lat_to_frac(center_lat);
+        // Half-span = farthest point from the center in each axis, so the span
+        // that must fit is symmetric about the fixed center.
+        let mut hx = 0.0f64;
+        let mut hy = 0.0f64;
+        for &(lat, lon) in points {
+            hx = hx.max((lon_to_frac(lon) - cfx).abs());
+            hy = hy.max((lat_to_frac(lat) - cfy).abs());
+        }
+
+        let mut zoom = MAX_ZOOM;
+        while zoom > 0 {
+            let scale = tile_size_at_zoom(zoom);
+            let w = 2.0 * hx * scale + PADDING_PX * 2.0;
+            let h = 2.0 * hy * scale + PADDING_PX * 2.0;
+            if w <= width as f64 && h <= height as f64 {
+                break;
+            }
+            zoom -= 1;
+        }
+
+        Viewport::new(center_lat, center_lon, zoom, width, height)
+    }
+
     /// Project a lat/lon into image-space pixel coordinates (origin top-left).
     pub fn project(&self, lat: f64, lon: f64) -> (f64, f64) {
         let x = lon_to_x(lon, self.zoom) - self.top_left_x;

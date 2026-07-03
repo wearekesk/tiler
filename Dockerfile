@@ -12,6 +12,7 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && rm -rf src
 
 COPY src ./src
+COPY assets ./assets
 # Bust the stub's cached build artifact so the real sources are compiled.
 RUN touch src/main.rs && cargo build --release --locked
 
