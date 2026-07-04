@@ -36,6 +36,25 @@ const MAX_OUTPUT_DIM: u32 = 8192;
 /// unbounded value overflows and panics; no real tileset needs this many.
 const MAX_ZOOM: u8 = 24;
 
+/// Caps how many renders rasterize at once. Each can allocate a pixmap up to
+/// `MAX_OUTPUT_DIM`² RGBA (~256 MiB), so without a gate a burst of large
+/// `size`×`scale` requests could exhaust memory even though each is individually
+/// capped. Rasterization is CPU-bound, so bounding concurrency to the core count
+/// also keeps the blocking pool from thrashing. Requests past the limit wait for
+/// a permit (they've only parsed cheap params at this point, so queueing is
+/// cheap) rather than being rejected.
+fn render_gate() -> &'static tokio::sync::Semaphore {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(2);
+        tokio::sync::Semaphore::new(permits)
+    })
+}
+
 /// Content ETag for a request. Folds in the query string, the resolved tile
 /// source, and the renderer version so a `304 Not Modified` can't serve stale
 /// output after the source or the code changes.
@@ -262,6 +281,13 @@ pub async fn static_map(req: &Request) -> poem::Result<Response> {
             Haversine.length(&line)
         })
         .fold(f64::NEG_INFINITY, f64::max);
+
+    // Bound the number of concurrent renders so a burst of large requests can't
+    // exhaust memory (see `render_gate`). Held across the whole render below.
+    let _permit = render_gate()
+        .acquire()
+        .await
+        .map_err(|e| internal_error(format!("render gate closed: {e}")))?;
 
     // Rendering the SVG and rasterizing it are both CPU-bound (many tiles, up to
     // an 8192x8192 pixmap). Do all of it on the blocking pool so the async

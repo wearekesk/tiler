@@ -129,15 +129,21 @@ pub async fn serve(req: &Request) -> Response {
 
     // TileJSON.
     let Some((z, x, y)) = parsed.tile else {
-        let host = config::public_hostname()
-            .map(str::to_string)
-            .or_else(|| {
-                req.headers()
-                    .get(header::HOST)
-                    .and_then(|h| h.to_str().ok())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+        // The TileJSON `tiles` URL must be absolute. Without a configured
+        // `PUBLIC_HOSTNAME` or a `Host` header we'd emit `https:///tiles/...`,
+        // which is unusable; reject rather than hand back a malformed template.
+        let Some(host) = config::public_hostname().map(str::to_string).or_else(|| {
+            req.headers()
+                .get(header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+        }) else {
+            return finish(text(
+                StatusCode::BAD_REQUEST,
+                "cannot build TileJSON: no Host header and PUBLIC_HOSTNAME is not set",
+            ));
+        };
         let ext = {
             let e = tile_extension(tile_type);
             if e.is_empty() {

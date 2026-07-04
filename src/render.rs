@@ -225,18 +225,18 @@ pub fn render_svg(
     }
 
     // Emit roads: all casings first, then all fills, each in ascending rank so
-    // motorways draw over residential streets. Road z-levels mirror the `road`
-    // bucket in `style.rs` (fill z=8, casing z=7).
-    const ROAD_CASING_Z: usize = 7;
-    const ROAD_FILL_Z: usize = 8;
+    // motorways draw over residential streets. The z-levels come straight from
+    // the `road` bucket in `style.rs` so the two can never drift apart.
+    let road_casing_z = crate::style::ROAD_CASING_Z as usize;
+    let road_fill_z = crate::style::ROAD_FILL_Z as usize;
     road_segments.sort_by_key(|s| s.0);
     for (_, casing, _) in &road_segments {
         if let Some(c) = casing {
-            levels[ROAD_CASING_Z].push_str(c);
+            levels[road_casing_z].push_str(c);
         }
     }
     for (_, _, fill) in &road_segments {
-        levels[ROAD_FILL_Z].push_str(fill);
+        levels[road_fill_z].push_str(fill);
     }
 
     // Declutter labels: place the most important first (lowest priority value

@@ -60,6 +60,12 @@ pub struct LayerStyle {
 /// Number of distinct z-order buckets; sized to hold every `z` used below.
 pub const Z_LEVELS: usize = 10;
 
+/// Painter's-algorithm z-level for the white road fill, and the darker casing
+/// drawn one level below it. Exposed so the renderer emits casing/fill into the
+/// same buckets this module assigns, instead of re-declaring the magic numbers.
+pub const ROAD_FILL_Z: u8 = 8;
+pub const ROAD_CASING_Z: u8 = ROAD_FILL_Z - 1;
+
 pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -> LayerStyle {
     let p = &PALETTE;
     let n = name.to_lowercase();
@@ -163,7 +169,7 @@ pub fn style_for_layer(name: &str, overrides: &HashMap<String, StyleOverride>) -
                 stroke_width: 1.5,
                 dash: None,
                 casing: Some(p.road_casing.to_string()),
-                z: 8,
+                z: ROAD_FILL_Z,
             },
         )
     } else if n.contains("boundary") || n.contains("admin") {
