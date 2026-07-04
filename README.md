@@ -77,10 +77,14 @@ startup):
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PMTILES_URL` | — | The PMTiles source (local path or `http(s)://` URL). **Required.** Fixed server-side; clients cannot choose the source. |
+| `PMTILES_URL` | — | The `/staticmap` PMTiles source (local path or `http(s)://` URL). **Required** for `/staticmap`. Fixed server-side; clients cannot choose the source. |
+| `PMTILES_PATH` | `{name}.pmtiles` | `/tiles` archive-name template; `{name}` from the request path is substituted. |
 | `PORT` | `3000` | Port to listen on. |
 | `RUST_LOG` | `info` | Log/trace filter (e.g. `info,tiler=debug`). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | When set, spans are exported to this OTLP/gRPC collector (e.g. `http://localhost:4317`). |
+| `ALLOWED_ORIGINS` | any | CORS: comma-separated allowed origins, or `*`/unset for any. |
+| `TILES_CACHE_CONTROL` | `public, max-age=86400` | `Cache-Control` for `/tiles` responses. |
+| `PUBLIC_HOSTNAME` | request `Host` | Hostname used in TileJSON `tiles` URLs. |
 
 Output size is capped: `size` is at most `4096x4096`, and the *scaled* output
 (`size` × `scale`) is capped at `8192` px per side to bound memory.
@@ -101,6 +105,20 @@ Output size is capped: `size` is at most `4096x4096`, and the *scaled* output
 | `visible=LAT,LON\|…` | ✓ | Extra points to include when auto-fitting the viewport. |
 
 Colors accept CSS names, `#rrggbb[aa]`, or Google-style `0xrrggbb[aa]`.
+
+### Tile server
+
+A raw PMTiles tile server is also mounted, serving whatever the archives contain
+(vector `mvt`, or raster `png`/`jpg`/`webp`):
+
+| Route | Description |
+| --- | --- |
+| `GET /tiles/{name}/{z}/{x}/{y}.{ext}` | A single tile. `name` may be nested (contain `/`). |
+| `GET /tiles/{name}.json` | The archive's TileJSON. |
+
+`name` is resolved to a source via `PMTILES_PATH`. The extension must match the
+archive's tile type (else `400`); out-of-range zoom is `404`; a tile absent from
+the archive is `204`.
 
 ### Examples
 

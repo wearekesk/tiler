@@ -1,47 +1,34 @@
-//! A "static maps" HTTP endpoint (similar in spirit to the Google Maps
-//! Static API), backed by a PMTiles vector tile archive.
+//! Kesk Maps Server: an HTTP service for map imagery from PMTiles archives.
 //!
-//! `GET /staticmap?size=WxH
-//!      [&center=LAT,LON&zoom=Z][&scale=1|2|4][&format=png|svg|jpeg]
-//!      [&markers=[color:C|label:L|size:S|]LAT,LON|LAT,LON..]* (repeatable)
-//!      [&path=[color:C|weight:W|fillcolor:C|]LAT,LON|LAT,LON..|enc:POLYLINE]* (repeatable)
-//!      [&style=feature:F|color:C|weight:W]* (repeatable)
-//!      [&visible=LAT,LON|LAT,LON..]* (repeatable)`
+//! - `GET /staticmap` — composed static map images (see [`handlers::staticmap`]).
+//! - `GET /tiles/...` — raw PMTiles tiles + TileJSON (see [`handlers::tiles`]).
 //!
-//! The tile source is fixed by the `PMTILES_URL` variable (via the environment,
-//! or a `.env` file loaded at startup with the `dotenv` crate).
-//!
-//! If `center`+`zoom` are omitted, the viewport is automatically fit to
-//! contain all `visible`, `markers`, and `path` points (like Google's
-//! `visible` parameter).
+//! Configured via the environment (a `.env` file is loaded at startup):
+//! `PMTILES_URL` (staticmap source), `PMTILES_PATH` (tile-server archive name
+//! template), `PORT`, `RUST_LOG`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+//! `ALLOWED_ORIGINS`, `TILES_CACHE_CONTROL`, `PUBLIC_HOSTNAME`.
 
+mod config;
 mod geo_util;
+mod handlers;
 mod params;
 mod render;
 mod style;
 mod tiles;
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
-
-use geo::algorithm::line_measures::{Haversine, Length};
-use geo_types::LineString;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
-use poem::http::{HeaderValue, StatusCode};
 use poem::listener::TcpListener;
-use poem::middleware::{CatchPanic, Tracing};
-use poem::{get, handler, EndpointExt, Request, Response, Route, Server};
+use poem::middleware::{CatchPanic, Cors, SetHeader, Tracing};
+use poem::{get, EndpointExt, Route, Server};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use geo_util::Viewport;
-use params::QueryMap;
-use render::render_svg;
-use tiles::TileSource;
-
+/// OpenTelemetry `service.name` for traces.
 const SERVICE_NAME: &str = "kesk-tiler";
+/// Outward-facing server name (the HTTP `Server` header).
+const SERVER_NAME: &str = "Kesk Maps Server";
 
 /// Initializes `tracing` (structured logs + spans). When
 /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, spans are also exported to that
@@ -85,340 +72,6 @@ fn init_telemetry() -> Option<SdkTracerProvider> {
     provider
 }
 
-/// Aggressive caching: a render is fully determined by its query string (and
-/// the immutable PMTiles source), so responses are safe to cache for a long
-/// time. `immutable` tells browsers never to revalidate within the window.
-const CACHE_CONTROL: &str = "public, max-age=86400, s-maxage=604800, immutable";
-
-/// Upper bound on each *scaled* output dimension (px). Caps pixmap allocation
-/// so a large `size` x `scale` can't exhaust memory (8192x8192 RGBA ~= 256 MiB).
-const MAX_OUTPUT_DIM: u32 = 8192;
-
-/// Upper bound on the `zoom` parameter. The tile math shifts by `zoom`, so an
-/// unbounded value overflows and panics; no real tileset needs this many.
-const MAX_ZOOM: u8 = 24;
-
-/// Content ETag for a request. Folds in the query string, the resolved tile
-/// source, and the renderer version so a `304 Not Modified` can't serve stale
-/// output after the source or the code changes.
-fn etag_for_request(query: &str, source: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    query.hash(&mut h);
-    source.hash(&mut h);
-    env!("CARGO_PKG_VERSION").hash(&mut h);
-    format!("\"{:016x}\"", h.finish())
-}
-
-/// The server-configured tile source. Read once (static config).
-fn configured_pmtiles_url() -> Option<&'static str> {
-    static V: OnceLock<Option<String>> = OnceLock::new();
-    V.get_or_init(|| std::env::var("PMTILES_URL").ok())
-        .as_deref()
-}
-
-/// Process-wide cache of opened tile sources, keyed by source string.
-/// Opening a PMTiles archive reads its header + root directory (a network
-/// round-trip for remote URLs), and the reader is thread-safe and reusable
-/// with its own internal caches — so open each source once and share it.
-// A std (sync) mutex is sufficient: the guard is only ever held for quick map
-// operations and never across the `.await` on `TileSource::open`.
-type SourceCache = std::sync::Mutex<HashMap<String, Arc<TileSource>>>;
-
-async fn get_source(pmtiles: &str) -> anyhow::Result<Arc<TileSource>> {
-    static SOURCES: OnceLock<SourceCache> = OnceLock::new();
-    let cache = SOURCES.get_or_init(Default::default);
-
-    // `unwrap_or_else(into_inner)` recovers the guard even if a thread panicked
-    // while holding the lock (poisoning), instead of cascading the panic.
-    {
-        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.get(pmtiles) {
-            return Ok(existing.clone());
-        }
-    }
-    // Open outside the lock so a slow open doesn't block; if a concurrent
-    // request opened the same source first, keep that one.
-    let opened = Arc::new(TileSource::open(pmtiles).await?);
-    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(map.entry(pmtiles.to_string()).or_insert(opened).clone())
-}
-
-fn bad_request(msg: impl std::fmt::Display) -> poem::Error {
-    poem::Error::from_string(msg.to_string(), StatusCode::BAD_REQUEST)
-}
-
-fn internal_error(msg: impl std::fmt::Display) -> poem::Error {
-    poem::Error::from_string(msg.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-fn parse_size(s: &str) -> poem::Result<(u32, u32)> {
-    let mut parts = s.split('x');
-    let w = parts
-        .next()
-        .ok_or_else(|| bad_request("missing width"))?
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| bad_request(format!("invalid width: {e}")))?;
-    let h = parts
-        .next()
-        .ok_or_else(|| bad_request("missing height"))?
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| bad_request(format!("invalid height: {e}")))?;
-    Ok((w, h))
-}
-
-#[handler]
-async fn static_map(req: &Request) -> poem::Result<Response> {
-    let query = req.uri().query().unwrap_or("");
-    let qm = QueryMap::parse(query);
-
-    // The tile source is fixed by the server (`PMTILES_URL`); clients cannot
-    // choose it, which removes any SSRF / local-file-read surface.
-    let pmtiles = configured_pmtiles_url()
-        .map(|s| s.to_string())
-        .ok_or_else(|| internal_error("PMTILES_URL is not configured"))?;
-
-    // Short-circuit unchanged renders: if the client already holds this exact
-    // output, skip all fetching/rasterization and return 304.
-    let etag = etag_for_request(query, &pmtiles);
-    if req
-        .headers()
-        .get("if-none-match")
-        .and_then(|v| v.to_str().ok())
-        == Some(etag.as_str())
-    {
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header("etag", etag)
-            .header("cache-control", CACHE_CONTROL)
-            .finish());
-    }
-
-    let (width, height) = parse_size(
-        qm.get_one("size")
-            .ok_or_else(|| bad_request("missing 'size' parameter"))?,
-    )?;
-    if width == 0 || height == 0 || width > 4096 || height > 4096 {
-        return Err(bad_request("size must be between 1x1 and 4096x4096"));
-    }
-
-    let scale: u32 = match qm.get_one("scale") {
-        Some(s) => s
-            .parse()
-            .map_err(|e| bad_request(format!("invalid scale: {e}")))?,
-        None => 1,
-    };
-    if ![1, 2, 4].contains(&scale) {
-        return Err(bad_request("scale must be 1, 2, or 4"));
-    }
-
-    // Guard against oversized allocations: an unguarded `size=4096x4096&scale=4`
-    // would demand a 16384x16384 pixmap (~1 GiB) and could OOM the process.
-    let out_width = width * scale;
-    let out_height = height * scale;
-    if out_width > MAX_OUTPUT_DIM || out_height > MAX_OUTPUT_DIM {
-        return Err(bad_request(format!(
-            "scaled output {out_width}x{out_height} exceeds {MAX_OUTPUT_DIM}x{MAX_OUTPUT_DIM}; reduce size or scale"
-        )));
-    }
-
-    let format = match qm.get_one("format").unwrap_or("png") {
-        f @ ("png" | "svg" | "jpeg" | "jpg") => f.to_string(),
-        other => {
-            return Err(bad_request(format!(
-                "invalid format '{other}': expected 'png', 'svg', or 'jpeg'"
-            )))
-        }
-    };
-
-    let center: Option<(f64, f64)> = qm.get_one("center").map(params::parse_latlon).transpose()?;
-    let zoom: Option<u8> = match qm.get_one("zoom") {
-        Some(s) => {
-            let z: u8 = s
-                .parse()
-                .map_err(|e| bad_request(format!("invalid zoom: {e}")))?;
-            // Bound the zoom: the tile math shifts by `zoom`, so an unbounded
-            // value would overflow `1 << zoom` and panic (DoS). No real tileset
-            // goes anywhere near this.
-            if z > MAX_ZOOM {
-                return Err(bad_request(format!(
-                    "zoom must be between 0 and {MAX_ZOOM}"
-                )));
-            }
-            Some(z)
-        }
-        None => None,
-    };
-
-    let marker_groups = params::parse_marker_groups(qm.get_all("markers"))?;
-    let paths = params::parse_path_specs(qm.get_all("path"))?;
-    let overrides = params::parse_style_overrides(qm.get_all("style"))?;
-    let visible_points = params::parse_visible(qm.get_all("visible"))?;
-
-    let viewport = match (center, zoom) {
-        (Some((lat, lon)), Some(z)) => Viewport::new(lat, lon, z, width, height),
-        _ => {
-            let mut fit_points = visible_points;
-            if let Some(c) = center {
-                fit_points.push(c);
-            }
-            for g in &marker_groups {
-                fit_points.extend(g.points.iter().copied());
-            }
-            for p in &paths {
-                fit_points.extend(p.points.iter().copied());
-            }
-            if fit_points.is_empty() {
-                return Err(bad_request(
-                    "provide either 'center'+'zoom', or 'visible'/'markers'/'path' points to auto-fit the viewport",
-                ));
-            }
-            match (center, zoom) {
-                // `zoom` given but no `center`: keep the requested zoom, just
-                // auto-center on the points instead of also auto-fitting zoom.
-                (None, Some(z)) => {
-                    let (lat, lon) = geo_util::center_of(&fit_points);
-                    Viewport::new(lat, lon, z, width, height)
-                }
-                // `center` given but no `zoom`: keep the requested center and
-                // only auto-fit the zoom so all points are visible.
-                (Some((lat, lon)), None) => {
-                    Viewport::fit_at_center(lat, lon, &fit_points, width, height)
-                }
-                _ => Viewport::fit(&fit_points, width, height),
-            }
-        }
-    };
-
-    let source = get_source(&pmtiles)
-        .await
-        .map_err(|e| internal_error(format!("failed to open pmtiles source: {e}")))?;
-
-    let covering = viewport.covering_tiles();
-    tracing::debug!(
-        zoom = viewport.zoom,
-        tiles = covering.len(),
-        width,
-        height,
-        "rendering static map"
-    );
-
-    // Fetch tiles concurrently: with a remote PMTiles URL, sequential
-    // round-trips would dominate latency. A tile that fails to fetch is skipped
-    // rather than failing the whole request.
-    // Each task returns `(tile, had_error)`. `Ok(None)` (a tile that simply
-    // isn't in the archive) is normal and not an error; a fetch/decode failure
-    // is. We still render what we got, but a degraded render must not be cached
-    // long-term (see the cache-header logic below).
-    let mut set = tokio::task::JoinSet::new();
-    for (z, x, y) in covering {
-        let source = source.clone();
-        set.spawn(async move {
-            match source.get_tile(z, x, y).await {
-                Ok(Some(bytes)) => match tiles::decode_tile(bytes.to_vec()) {
-                    Ok(layers) => (Some(((z, x, y), layers)), false),
-                    Err(e) => {
-                        tracing::warn!(z, x, y, error = %e, "failed to decode tile");
-                        (None, true)
-                    }
-                },
-                Ok(None) => (None, false),
-                Err(e) => {
-                    tracing::warn!(z, x, y, error = %e, "failed to fetch tile");
-                    (None, true)
-                }
-            }
-        });
-    }
-
-    let mut tiles = Vec::new();
-    let mut had_tile_error = false;
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok((Some(tile), err)) => {
-                tiles.push(tile);
-                had_tile_error |= err;
-            }
-            Ok((None, err)) => had_tile_error |= err,
-            // A panicked/cancelled fetch task also counts as a degraded render.
-            Err(_) => had_tile_error = true,
-        }
-    }
-    // Restore a deterministic order (JoinSet completes out of order) so tiles
-    // composite identically across requests.
-    tiles.sort_by_key(|((z, x, y), _)| (*z, *x, *y));
-
-    // Compute the longest route's length (by measured distance) before `paths`
-    // is moved into the render task below.
-    let longest_meters = paths
-        .iter()
-        .filter(|p| p.points.len() >= 2)
-        .map(|p| {
-            let line: LineString<f64> = p.points.iter().map(|(lat, lon)| (*lon, *lat)).collect();
-            Haversine.length(&line)
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
-
-    // Rendering the SVG and rasterizing it are both CPU-bound (many tiles, up to
-    // an 8192x8192 pixmap). Do all of it on the blocking pool so the async
-    // worker thread stays free, and so the large SVG string never crosses a
-    // thread boundary.
-    let (bytes, content_type) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let svg = render_svg(
-            &viewport,
-            &tiles,
-            &overrides,
-            &marker_groups,
-            &paths,
-            out_width,
-            out_height,
-        );
-        let out: (Vec<u8>, &'static str) = match format.as_str() {
-            "svg" => (svg.into_bytes(), "image/svg+xml"),
-            // Quality 100: maximum fidelity (map imagery has sharp edges/text).
-            "jpeg" | "jpg" => (
-                render::svg_to_jpeg(&svg, out_width, out_height, 100)?,
-                "image/jpeg",
-            ),
-            _ => (
-                render::svg_to_png(&svg, out_width, out_height)?,
-                "image/png",
-            ),
-        };
-        Ok(out)
-    })
-    .await
-    .map_err(|e| internal_error(format!("render task panicked: {e}")))?
-    .map_err(|e| internal_error(format!("failed to render image: {e}")))?;
-
-    let mut response = Response::builder().content_type(content_type).body(bytes);
-
-    {
-        let headers = response.headers_mut();
-        if had_tile_error {
-            // A tile fetch/decode failed, so this render may be incomplete —
-            // don't let it be cached long-term with a durable ETag.
-            headers.insert("cache-control", "no-store".parse().unwrap());
-        } else {
-            headers.insert("cache-control", CACHE_CONTROL.parse().unwrap());
-            headers.insert("etag", etag.parse().unwrap());
-        }
-    }
-
-    if longest_meters.is_finite() {
-        // `f64 as u64` saturates (>= 0, NaN -> 0), and `HeaderValue::from` for an
-        // integer is infallible — no string round-trip needed.
-        let meters = longest_meters.round() as u64;
-        response
-            .headers_mut()
-            .insert("x-route-length-meters", HeaderValue::from(meters));
-    }
-
-    Ok(response)
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
@@ -428,10 +81,25 @@ async fn main() -> std::io::Result<()> {
     // Load the system font database now so the first render doesn't pay for it.
     render::warm_fontdb();
 
+    // CORS: allow any origin by default, or restrict to a comma-separated
+    // `ALLOWED_ORIGINS` list (`*` also means any).
+    let cors = match config::allowed_origins() {
+        Some(v) if !v.trim().is_empty() && v.trim() != "*" => {
+            Cors::new().allow_origins(v.split(',').map(|s| s.trim().to_string()))
+        }
+        _ => Cors::new(),
+    };
+
     // `CatchPanic` (innermost) turns any handler panic into a 500 instead of
-    // killing the worker task; `Tracing` (outermost) still logs the response.
+    // killing the worker; `Tracing` (outermost) still logs the response.
     let app = Route::new()
-        .at("/staticmap", get(static_map))
+        .at("/staticmap", get(handlers::staticmap::static_map))
+        // Raw PMTiles tile server (z/x/y tiles + TileJSON); `name` may be nested
+        // so match everything under /tiles.
+        .at("/tiles", get(handlers::tiles::serve))
+        .at("/tiles/*path", get(handlers::tiles::serve))
+        .with(cors)
+        .with(SetHeader::new().overriding("Server", SERVER_NAME))
         .with(CatchPanic::new())
         .with(Tracing);
 
@@ -440,10 +108,7 @@ async fn main() -> std::io::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    tracing::info!(
-        port,
-        "{SERVICE_NAME} listening on http://0.0.0.0:{port}/staticmap"
-    );
+    tracing::info!(port, "{SERVER_NAME} listening on http://0.0.0.0:{port}");
     Server::new(TcpListener::bind(format!("0.0.0.0:{port}")))
         .run(app)
         .await
