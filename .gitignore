@@ -2,3 +2,6 @@
 .env
 *.png
 *.svg
+
+# Local agent/harness state
+.claude/

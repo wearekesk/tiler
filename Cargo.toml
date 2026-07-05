@@ -1,0 +1,32 @@
+[package]
+name = "tiler"
+version = "0.1.0"
+edition = "2021"
+description = "Static maps HTTP endpoint rendering SVG/PNG tiles from a PMTiles archive"
+
+[dependencies]
+poem = { version = "3", default-features = false, features = ["server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+
+pmtiles = { version = "0.23", default-features = false, features = ["http-async", "mmap-async-tokio", "tilejson"] }
+bytes = "1"
+reqwest = "0.13"
+serde_json = "1"
+mvt-reader = "2.4"
+geo-types = "0.7"
+geo = "0.33"
+url = "2"
+dotenv = "0.15"
+
+resvg = "0.47"
+jpeg-encoder = "0.7"
+
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }

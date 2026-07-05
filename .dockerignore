@@ -1,0 +1,7 @@
+target
+.git
+.github
+.env
+*.png
+*.svg
+.claude

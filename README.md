@@ -18,8 +18,8 @@ GET /staticmap?center=43.7715,11.2540&zoom=15&size=640x480
 
 - **PNG or SVG** output, at `scale` 1/2/4 for HiDPI.
 - **Seamless tiling.** Tiles are composited layer-major (painter's algorithm
-  across the whole scene) with a small per-tile "bleed", so there are no grey
-  seams where tiles meet.
+  across the whole scene) and each fill is sealed with a stroke of its own
+  color, so there are no grey seams where tiles meet.
 - **Google-Maps-style** default palette (land, water, parks, buildings, roads,
   railways, waterways, boundaries).
 - **Markers** with color, single-letter label, and size.
@@ -49,6 +49,27 @@ Then open, for example:
 http://localhost:3000/staticmap?center=43.7715,11.2540&zoom=15&size=640x480&format=png
 ```
 
+### Docker
+
+A multi-arch image (linux/amd64 + linux/arm64) is published to GitHub Container
+Registry on each release tag:
+
+```sh
+docker run --rm -p 3000:3000 \
+  -e PMTILES_URL="https://protomaps.github.io/PMTiles/protomaps(vector)ODbL_firenze.pmtiles" \
+  ghcr.io/wearekesk/tiler:latest
+```
+
+Or build it locally:
+
+```sh
+docker build -t tiler .
+docker run --rm -p 3000:3000 -e PMTILES_URL=... tiler
+```
+
+The image runs as a non-root user and includes CA certificates (for HTTPS
+PMTiles URLs) and a base font (so text labels render).
+
 ### Configuration
 
 All configuration is via environment variables (a `.env` file is loaded at
@@ -56,10 +77,17 @@ startup):
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PMTILES_URL` | — | Default PMTiles source (local path or `http(s)://` URL). Used when a request omits `pmtiles`. |
+| `PMTILES_URL` | — | The `/staticmap` PMTiles source (local path or `http(s)://` URL). **Required** for `/staticmap`. Fixed server-side; clients cannot choose the source. |
+| `PMTILES_PATH` | `{name}.pmtiles` | `/tiles` archive-name template; `{name}` from the request path is substituted. |
 | `PORT` | `3000` | Port to listen on. |
 | `RUST_LOG` | `info` | Log/trace filter (e.g. `info,tiler=debug`). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | When set, spans are exported to this OTLP/gRPC collector (e.g. `http://localhost:4317`). |
+| `ALLOWED_ORIGINS` | any | CORS: comma-separated allowed origins, or `*`/unset for any. |
+| `TILES_CACHE_CONTROL` | `public, max-age=86400` | `Cache-Control` for `/tiles` responses. |
+| `PUBLIC_HOSTNAME` | request `Host` | Hostname used in TileJSON `tiles` URLs. |
+
+Output size is capped: `size` is at most `4096x4096`, and the *scaled* output
+(`size` × `scale`) is capped at `8192` px per side to bound memory.
 
 ## API
 
@@ -68,16 +96,29 @@ startup):
 | Parameter | Repeatable | Description |
 | --- | --- | --- |
 | `size=WxH` | | **Required.** Output size in pixels (max `4096x4096`). |
-| `pmtiles=PATH_OR_URL` | | PMTiles source; falls back to `PMTILES_URL`. |
 | `center=LAT,LON` & `zoom=Z` | | Viewport center and zoom. If omitted, the viewport auto-fits the points below. |
-| `scale=1\|2\|4` | | Pixel density multiplier (default `1`). |
-| `format=png\|svg` | | Output format (default `png`). |
+| `scale=1\|2\|4` | | Pixel-density multiplier (default `1`). **Use `scale=2` on HiDPI/Retina** — a `scale=1` raster is upscaled by the browser and looks soft, while `svg` stays crisp because it's vector. |
+| `format=png\|svg\|jpeg` | | Output format (default `png`). `jpeg` (alias `jpg`) is encoded at quality 100; `svg` is vector (crispest). |
 | `markers=[color:C\|label:L\|size:S\|]LAT,LON\|…` | ✓ | A marker group. `size` is `tiny\|small\|mid`. |
 | `path=[color:C\|weight:W\|fillcolor:C\|]LAT,LON\|…` | ✓ | A route path. Accepts `enc:<polyline>` instead of coordinate pairs. |
 | `style=feature:F\|color:C\|weight:W` | ✓ | Override a feature bucket's color/weight. `F` is one of `earth,landuse,water,waterway,building,road,transit,boundary,other`, or `all`. |
 | `visible=LAT,LON\|…` | ✓ | Extra points to include when auto-fitting the viewport. |
 
 Colors accept CSS names, `#rrggbb[aa]`, or Google-style `0xrrggbb[aa]`.
+
+### Tile server
+
+A raw PMTiles tile server is also mounted, serving whatever the archives contain
+(vector `mvt`, or raster `png`/`jpg`/`webp`):
+
+| Route | Description |
+| --- | --- |
+| `GET /tiles/{name}/{z}/{x}/{y}.{ext}` | A single tile. `name` may be nested (contain `/`). |
+| `GET /tiles/{name}.json` | The archive's TileJSON. |
+
+`name` is resolved to a source via `PMTILES_PATH`. The extension must match the
+archive's tile type (else `400`); out-of-range zoom is `404`; a tile absent from
+the archive is `204`.
 
 ### Examples
 
@@ -105,7 +146,7 @@ The source is organized as a handful of modules:
 - `geo_util.rs` — Web-Mercator projection and viewport/tile math.
 - `params.rs` — query-string parsing (markers, paths, styles, encoded polylines).
 - `style.rs` — the Google-Maps-like palette and per-layer styling.
-- `render.rs` — SVG assembly (layer-major compositing, tile bleed) and PNG rasterization.
+- `render.rs` — SVG assembly (layer-major compositing, fill sealing) and PNG rasterization.
 
 ### Why the tiles are seamless
 
@@ -113,5 +154,7 @@ Vector features are clipped per tile, and a naive tile-by-tile renderer draws
 each tile's full-tile background *after* its neighbor's foreground, so the
 background repaints over the seam — a visible grey line along every tile edge.
 `tiler` instead composites **layer-major across all tiles** (all `earth`, then
-all `landuse`, then buildings, …) and grows each tile's geometry outward by ~1px
-("bleed") so neighbors overlap. Together these remove the seams.
+all `landuse`, then buildings, …) so a background never lands on top of a
+neighbor's foreground, and seals each fill with a 1px stroke of its own color to
+cover the sub-pixel anti-aliasing gap where two fills meet. Together these
+remove the seams — without distorting feature geometry.
