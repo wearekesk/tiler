@@ -152,10 +152,29 @@ pub async fn serve(req: &Request) -> Response {
                 e
             }
         };
-        let tile_url = format!(
-            "https://{host}/tiles/{}/{{z}}/{{x}}/{{y}}.{ext}",
-            parsed.name
-        );
+        // Build an absolute tiles URL. If `PUBLIC_HOSTNAME` already carries a
+        // scheme, honor it verbatim; otherwise pick one from `X-Forwarded-Proto`
+        // (set by a TLS-terminating proxy), falling back to `http` for loopback
+        // and `https` elsewhere so local dev over plain HTTP still works.
+        let base = if host.contains("://") {
+            format!("{host}/tiles/{}", parsed.name)
+        } else {
+            let scheme = req
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.split(',').next().unwrap_or(s).trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+                        "http"
+                    } else {
+                        "https"
+                    }
+                });
+            format!("{scheme}://{host}/tiles/{}", parsed.name)
+        };
+        let tile_url = format!("{base}/{{z}}/{{x}}/{{y}}.{ext}");
         return match source.tilejson_string(tile_url).await {
             Ok(json) => finish(
                 Response::builder()

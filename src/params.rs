@@ -63,13 +63,20 @@ pub fn parse_latlon(s: &str) -> poem::Result<(f64, f64)> {
     Ok((lat, lon))
 }
 
-/// Parses a non-negative, finite stroke weight, rejecting `NaN`/`Infinity`.
+/// Largest accepted stroke weight (px). An absurd value (e.g. `1e30`) would
+/// blow up rasterization in `resvg`/`tiny-skia`; no real stroke needs more.
+const MAX_WEIGHT: f32 = 1000.0;
+
+/// Parses a finite stroke weight in `[0, MAX_WEIGHT]`, rejecting
+/// `NaN`/`Infinity` and absurdly large values.
 fn parse_weight(value: &str, what: &str) -> poem::Result<f32> {
     let w = value
         .parse::<f32>()
         .map_err(|e| bad_request(format!("invalid {what}: {e}")))?;
-    if !w.is_finite() || w < 0.0 {
-        return Err(bad_request(format!("{what} must be finite and >= 0: {w}")));
+    if !w.is_finite() || !(0.0..=MAX_WEIGHT).contains(&w) {
+        return Err(bad_request(format!(
+            "{what} must be finite and between 0 and {MAX_WEIGHT}: {w}"
+        )));
     }
     Ok(w)
 }
