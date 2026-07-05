@@ -188,8 +188,11 @@ pub fn render_svg(
                             // seal stroke here — a fill-colored seal would stick
                             // out past a thin border (e.g. buildings) as a fuzzy
                             // halo.
+                            // `evenodd` so inner rings (e.g. lake islands,
+                            // courtyards) punch holes regardless of the source
+                            // geometry's ring winding order.
                             levels[zi].push_str(&format!(
-                                "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"none\" />\n",
+                                "<path d=\"{path_d}\" fill=\"{fill}\" fill-rule=\"evenodd\" stroke=\"none\" />\n",
                             ));
                             levels[zi].push_str(&format!(
                                 "<path d=\"{path_d}\" fill=\"none\" stroke=\"{border}\" stroke-width=\"{}\"{dash} />\n",
@@ -202,7 +205,7 @@ pub fn render_svg(
                             // anti-aliased edges overlap instead of leaving a
                             // hairline seam.
                             levels[zi].push_str(&format!(
-                                "<path d=\"{path_d}\" fill=\"{fill}\" stroke=\"{fill}\" stroke-width=\"{seal_width:.3}\" />\n",
+                                "<path d=\"{path_d}\" fill=\"{fill}\" fill-rule=\"evenodd\" stroke=\"{fill}\" stroke-width=\"{seal_width:.3}\" />\n",
                             ));
                         }
                     } else if let Some(stroke) = stroke.as_deref() {
@@ -730,7 +733,7 @@ fn render_path(viewport: &Viewport, spec: &PathSpec) -> String {
     if let Some(fillcolor) = &spec.fillcolor {
         let fillcolor = xml_escape(fillcolor);
         out.push_str(&format!(
-            "<path d=\"{d}Z\" fill=\"{fillcolor}\" stroke=\"none\" />\n"
+            "<path d=\"{d}Z\" fill=\"{fillcolor}\" fill-rule=\"evenodd\" stroke=\"none\" />\n"
         ));
     }
 

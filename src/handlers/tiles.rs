@@ -99,10 +99,13 @@ fn text(status: StatusCode, msg: &str) -> Response {
 /// Finalizes a response with the tile cache-control header. (CORS is handled by
 /// the `Cors` middleware at the app level.)
 fn finish(mut resp: Response) -> Response {
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        config::tiles_cache_control().parse().unwrap(),
-    );
+    // A misconfigured (e.g. non-ASCII) `TILES_CACHE_CONTROL` must not crash the
+    // server; fall back to a safe default header value instead of panicking.
+    let cache_control = config::tiles_cache_control()
+        .parse()
+        .unwrap_or_else(|_| header::HeaderValue::from_static("public, max-age=86400"));
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, cache_control);
     resp
 }
 
@@ -166,7 +169,10 @@ pub async fn serve(req: &Request) -> Response {
                 .map(|s| s.split(',').next().unwrap_or(s).trim())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| {
-                    if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+                    if host.starts_with("localhost")
+                        || host.starts_with("127.0.0.1")
+                        || host.starts_with("[::1]")
+                    {
                         "http"
                     } else {
                         "https"
