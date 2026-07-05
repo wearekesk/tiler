@@ -9,9 +9,12 @@ poem = { version = "3", default-features = false, features = ["server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 
-pmtiles = { version = "0.23", default-features = false, features = ["http-async", "mmap-async-tokio", "tilejson"] }
+# rustls only — no OpenSSL/native-tls anywhere in the tree. The `reqwest-rustls*`
+# features turn on reqwest's rustls stack (with the OS trust store) for HTTPS
+# PMTiles URLs; reqwest is reached only via `pmtiles::reqwest`, so it isn't a
+# direct dependency.
+pmtiles = { version = "0.23", default-features = false, features = ["http-async", "mmap-async-tokio", "tilejson", "reqwest-rustls"] }
 bytes = "1"
-reqwest = "0.13"
 serde_json = "1"
 mvt-reader = "2.4"
 geo-types = "0.7"
@@ -29,4 +32,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+# Traces only, exported over gRPC (tonic). Dropping the defaults removes the
+# HTTP/reqwest-blocking exporter path (which otherwise pulls reqwest's
+# `default-tls`) and the unused metrics/logs code.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
