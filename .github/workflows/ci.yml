@@ -19,7 +19,7 @@ jobs:
     name: Build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         # Build/test-only job: don't leave the token in the workspace .git config.
         with:
           persist-credentials: false
@@ -30,7 +30,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -50,3 +50,25 @@ jobs:
 
       - name: Test
         run: cargo test --locked --verbose
+
+  # Validate the Alpine/musl runtime image actually builds (exercises the
+  # aws-lc-sys musl compile behind rustls). Build only, no push — the release
+  # workflow handles multi-arch publishing.
+  docker-build:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (amd64, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
