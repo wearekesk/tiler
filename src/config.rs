@@ -50,29 +50,75 @@ fn parse_aliases(raw: Option<&str>) -> HashMap<String, String> {
     let Some(raw) = raw else {
         return map;
     };
-    for entry in raw.split(['\n', ',']) {
-        // Split on the first `=` only, so a source value may itself contain `=`
-        // (e.g. a URL with a query string).
-        let Some((alias, target)) = entry.split_once('=') else {
-            continue;
-        };
-        let (alias, target) = (alias.trim(), target.trim());
-        if alias.is_empty() || target.is_empty() {
-            continue;
+    // Entries are separated by newlines or commas. A source URL may itself
+    // contain a comma (e.g. `?layers=roads,buildings`), which the comma split
+    // would otherwise truncate — so within a line, a comma-separated fragment
+    // with no `=` is folded back onto the previous entry's value as a literal
+    // comma. Newlines are always hard separators.
+    for line in raw.split('\n') {
+        let mut pending: Option<String> = None;
+        for frag in line.split(',') {
+            if starts_new_alias(frag) {
+                insert_alias(&mut map, pending.take());
+                pending = Some(frag.to_string());
+            } else if !frag.trim().is_empty() {
+                // Not a new `alias=...` entry and not just separator whitespace:
+                // this is the tail of a value that contained a literal comma
+                // (e.g. `?layers=roads,buildings`), so re-attach it.
+                if let Some(p) = pending.as_mut() {
+                    p.push(',');
+                    p.push_str(frag);
+                }
+                // else: stray text with nothing pending — ignore.
+            }
         }
-        // `/tiles` archives are served only from a backend URL; a local disk
-        // path is rejected so a misconfigured path can't be silently opened.
-        if !(target.starts_with("http://") || target.starts_with("https://")) {
-            tracing::warn!(
-                alias,
-                url = target,
-                "ignoring PMTILES_ALIASES entry: source must be an http(s):// URL"
-            );
-            continue;
-        }
-        map.insert(alias.to_string(), target.to_string());
+        insert_alias(&mut map, pending.take());
     }
     map
+}
+
+/// Whether a comma-separated fragment begins a new `alias=source` entry, rather
+/// than being the continuation of a previous value that contained a comma. True
+/// only when the text before the first `=` is a plausible alias name (the same
+/// character set accepted for request names).
+fn starts_new_alias(frag: &str) -> bool {
+    match frag.split_once('=') {
+        Some((key, _)) => {
+            let key = key.trim();
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+        }
+        None => false,
+    }
+}
+
+/// Parses a single `alias=source` entry and inserts it, if valid.
+fn insert_alias(map: &mut HashMap<String, String>, entry: Option<String>) {
+    let Some(entry) = entry else {
+        return;
+    };
+    // Split on the first `=` only, so a source value may itself contain `=`
+    // (e.g. a URL with a query string).
+    let Some((alias, target)) = entry.split_once('=') else {
+        return;
+    };
+    let (alias, target) = (alias.trim(), target.trim());
+    if alias.is_empty() || target.is_empty() {
+        return;
+    }
+    // `/tiles` archives are served only from a backend URL; a local disk path
+    // is rejected so a misconfigured path can't be silently opened.
+    if !(target.starts_with("http://") || target.starts_with("https://")) {
+        tracing::warn!(
+            alias,
+            url = target,
+            "ignoring PMTILES_ALIASES entry: source must be an http(s):// URL"
+        );
+        return;
+    }
+    map.insert(alias.to_string(), target.to_string());
 }
 
 /// `Cache-Control` for `/tiles` responses (defaulted).
@@ -106,20 +152,36 @@ mod tests {
     }
 
     #[test]
-    fn keeps_equals_in_value_and_skips_malformed() {
-        let map = parse_aliases(Some("q=https://h/a.pmtiles?k=v,,broken,=x,y="));
+    fn keeps_equals_and_commas_in_url_value() {
+        // A `,` inside the URL (here a query value) must not truncate it, and
+        // `=` in the query string is preserved (only the first `=` splits).
+        let map = parse_aliases(Some("q=https://h/a.pmtiles?layers=roads,buildings&k=v"));
         assert_eq!(
             map.get("q").map(String::as_str),
-            Some("https://h/a.pmtiles?k=v")
+            Some("https://h/a.pmtiles?layers=roads,buildings&k=v")
+        );
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn skips_malformed_and_empty_entries() {
+        let map = parse_aliases(Some("nourl,=noalias,alias=,ok=https://h/a.pmtiles"));
+        assert_eq!(
+            map.get("ok").map(String::as_str),
+            Some("https://h/a.pmtiles")
         );
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn rejects_non_url_sources() {
-        let map =
-            parse_aliases(Some("disk=/data/firenze.pmtiles,rel=firenze.pmtiles,ok=https://h/a.pmtiles"));
-        assert_eq!(map.get("ok").map(String::as_str), Some("https://h/a.pmtiles"));
+        let map = parse_aliases(Some(
+            "disk=/data/firenze.pmtiles\nrel=firenze.pmtiles\nok=https://h/a.pmtiles",
+        ));
+        assert_eq!(
+            map.get("ok").map(String::as_str),
+            Some("https://h/a.pmtiles")
+        );
         assert!(map.get("disk").is_none());
         assert!(map.get("rel").is_none());
         assert_eq!(map.len(), 1);

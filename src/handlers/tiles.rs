@@ -124,9 +124,11 @@ pub async fn serve(req: &Request) -> Response {
     };
 
     // No alias for this name: nothing to serve. This is an ordinary "not found",
-    // not an error worth logging.
+    // not an error worth logging. Return it *without* `finish` so the long-lived
+    // tile `Cache-Control` isn't applied — an operator adding the alias and
+    // restarting must not be defeated by a 404 cached for a day.
     let Some(resolved) = resolve_source(&parsed.name) else {
-        return finish(text(StatusCode::NOT_FOUND, "Unknown archive"));
+        return text(StatusCode::NOT_FOUND, "Unknown archive");
     };
     let source = match get_source(resolved).await {
         Ok(s) => s,
@@ -134,14 +136,15 @@ pub async fn serve(req: &Request) -> Response {
         // a TLS/network error reaching a remote archive, an upstream 5xx, or a
         // timeout. The client still gets a generic 404, but we log the real
         // cause (with the resolved source) so operators can tell these apart
-        // instead of guessing at an opaque "Archive not found".
+        // instead of guessing at an opaque "Archive not found". No `finish`
+        // here either: a transient failure must not be cached for a day.
         Err(e) => {
             tracing::warn!(
                 source = %resolved,
                 error = %format!("{e:#}"),
                 "failed to open PMTiles source"
             );
-            return finish(text(StatusCode::NOT_FOUND, "Archive not found"));
+            return text(StatusCode::NOT_FOUND, "Archive not found");
         }
     };
     let (tile_type, min_zoom, max_zoom) = source.header_info();
