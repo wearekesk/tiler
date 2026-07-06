@@ -58,7 +58,7 @@ fn parse_aliases(raw: Option<&str>) -> HashMap<String, String> {
     for line in raw.split('\n') {
         let mut pending: Option<String> = None;
         for frag in line.split(',') {
-            if starts_new_alias(frag) {
+            if starts_new_alias(frag, pending.as_deref()) {
                 insert_alias(&mut map, pending.take());
                 pending = Some(frag.to_string());
             } else if !frag.trim().is_empty() {
@@ -77,25 +77,35 @@ fn parse_aliases(raw: Option<&str>) -> HashMap<String, String> {
     map
 }
 
-/// Whether a comma-separated fragment begins a new `alias=source` entry, rather
-/// than being the continuation of a previous value that contained a comma. True
-/// only when the text before the first `=` is a plausible alias name (the same
-/// character set accepted for request names) *and* the value is a backend URL.
-/// Requiring the `http(s)://` prefix is what distinguishes a real entry from a
-/// URL query parameter that happens to look like `key=value` (e.g. the
-/// `format=png` in `?layers=roads,format=png`), which must not split the URL.
-fn starts_new_alias(frag: &str) -> bool {
-    match frag.split_once('=') {
-        Some((key, val)) => {
-            let key = key.trim();
-            let val = val.trim();
-            !key.is_empty()
-                && (val.starts_with("http://") || val.starts_with("https://"))
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+/// Whether a comma-separated fragment begins a new `alias=source` entry (rather
+/// than being the tail of a previous value that contained a comma). Requires the
+/// text before the first `=` to be a plausible alias name (the character set
+/// accepted for request names).
+///
+/// `pending` is the entry currently being accumulated, if any. With nothing
+/// pending, any `valid-key=...` fragment starts an entry — including a
+/// misconfigured non-URL one, so `insert_alias` can warn about it rather than
+/// silently dropping it. When an entry is already pending, this fragment came
+/// after a comma: it is a genuinely new entry only if it's clearly a fresh URL,
+/// or if the pending value has no `?` — since only a query string can hold a
+/// comma we'd want to fold back (e.g. `?layers=roads,format=png`).
+fn starts_new_alias(frag: &str, pending: Option<&str>) -> bool {
+    let Some((key, val)) = frag.split_once('=') else {
+        return false;
+    };
+    let (key, val) = (key.trim(), val.trim());
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
+        return false;
+    }
+    match pending {
+        None => true,
+        Some(pending) => {
+            val.starts_with("http://") || val.starts_with("https://") || !pending.contains('?')
         }
-        None => false,
     }
 }
 
@@ -209,6 +219,22 @@ mod tests {
         );
         assert!(map.get("disk").is_none());
         assert!(map.get("rel").is_none());
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn non_url_alias_next_to_valid_one_on_same_line_is_dropped_not_folded() {
+        // A misconfigured non-URL entry sharing a comma-separated line with a
+        // valid one must not corrupt the valid URL: it is recognized as its own
+        // (rejected) entry rather than folded onto the previous value.
+        let map = parse_aliases(Some(
+            "planet=https://h/p.pmtiles,disk=/data/firenze.pmtiles",
+        ));
+        assert_eq!(
+            map.get("planet").map(String::as_str),
+            Some("https://h/p.pmtiles")
+        );
+        assert!(map.get("disk").is_none());
         assert_eq!(map.len(), 1);
     }
 }

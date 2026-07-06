@@ -119,6 +119,18 @@ fn text(status: StatusCode, msg: &str) -> Response {
         .body(msg.to_string())
 }
 
+/// Marks a response as explicitly non-cacheable. Used for transient or
+/// config-dependent 404s (an unopenable source, or a name with no alias yet) so
+/// a browser, CDN, or proxy doesn't cache the failure — otherwise a heuristic
+/// cache could hold a 404 that a fixed config or recovered upstream would clear.
+fn no_cache(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    resp
+}
+
 /// Finalizes a response with the tile cache-control header. (CORS is handled by
 /// the `Cors` middleware at the app level.)
 fn finish(mut resp: Response) -> Response {
@@ -148,11 +160,11 @@ pub async fn serve(req: &Request) -> Response {
     };
 
     // No alias for this name: nothing to serve. This is an ordinary "not found",
-    // not an error worth logging. Return it *without* `finish` so the long-lived
-    // tile `Cache-Control` isn't applied — an operator adding the alias and
-    // restarting must not be defeated by a 404 cached for a day.
+    // not an error worth logging. Return it as explicitly non-cacheable — an
+    // operator adding the alias and restarting must not be defeated by a cached
+    // 404.
     let Some(resolved) = resolve_source(&parsed.name) else {
-        return text(StatusCode::NOT_FOUND, "Unknown archive");
+        return no_cache(text(StatusCode::NOT_FOUND, "Unknown archive"));
     };
     let source = match get_source(resolved).await {
         Ok(s) => s,
@@ -160,15 +172,15 @@ pub async fn serve(req: &Request) -> Response {
         // a TLS/network error reaching a remote archive, an upstream 5xx, or a
         // timeout. The client still gets a generic 404, but we log the real
         // cause (with the resolved source) so operators can tell these apart
-        // instead of guessing at an opaque "Archive not found". No `finish`
-        // here either: a transient failure must not be cached for a day.
+        // instead of guessing at an opaque "Archive not found". Marked
+        // non-cacheable: a transient failure must not be cached.
         Err(e) => {
             tracing::warn!(
                 source = %redact_source(resolved),
                 error = %format!("{e:#}"),
                 "failed to open PMTiles source"
             );
-            return text(StatusCode::NOT_FOUND, "Archive not found");
+            return no_cache(text(StatusCode::NOT_FOUND, "Archive not found"));
         }
     };
     let (tile_type, min_zoom, max_zoom) = source.header_info();
