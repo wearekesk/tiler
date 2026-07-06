@@ -80,12 +80,17 @@ fn parse_aliases(raw: Option<&str>) -> HashMap<String, String> {
 /// Whether a comma-separated fragment begins a new `alias=source` entry, rather
 /// than being the continuation of a previous value that contained a comma. True
 /// only when the text before the first `=` is a plausible alias name (the same
-/// character set accepted for request names).
+/// character set accepted for request names) *and* the value is a backend URL.
+/// Requiring the `http(s)://` prefix is what distinguishes a real entry from a
+/// URL query parameter that happens to look like `key=value` (e.g. the
+/// `format=png` in `?layers=roads,format=png`), which must not split the URL.
 fn starts_new_alias(frag: &str) -> bool {
     match frag.split_once('=') {
-        Some((key, _)) => {
+        Some((key, val)) => {
             let key = key.trim();
+            let val = val.trim();
             !key.is_empty()
+                && (val.starts_with("http://") || val.starts_with("https://"))
                 && key
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
@@ -154,13 +159,33 @@ mod tests {
     #[test]
     fn keeps_equals_and_commas_in_url_value() {
         // A `,` inside the URL (here a query value) must not truncate it, and
-        // `=` in the query string is preserved (only the first `=` splits).
-        let map = parse_aliases(Some("q=https://h/a.pmtiles?layers=roads,buildings&k=v"));
+        // `=` in the query string is preserved (only the first `=` splits). The
+        // `format=png` after the comma looks like `alias=value` but is a query
+        // parameter, not a new entry, since its value isn't an http(s):// URL.
+        let map = parse_aliases(Some("q=https://h/a.pmtiles?layers=roads,format=png&k=v"));
         assert_eq!(
             map.get("q").map(String::as_str),
-            Some("https://h/a.pmtiles?layers=roads,buildings&k=v")
+            Some("https://h/a.pmtiles?layers=roads,format=png&k=v")
         );
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn splits_multiple_comma_separated_url_aliases() {
+        // Two real aliases on one comma-separated line still split correctly,
+        // because each value is an http(s):// URL.
+        let map = parse_aliases(Some(
+            "planet=https://h/p.pmtiles,firenze=https://h/f.pmtiles",
+        ));
+        assert_eq!(
+            map.get("planet").map(String::as_str),
+            Some("https://h/p.pmtiles")
+        );
+        assert_eq!(
+            map.get("firenze").map(String::as_str),
+            Some("https://h/f.pmtiles")
+        );
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
