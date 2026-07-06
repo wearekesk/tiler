@@ -78,7 +78,7 @@ startup):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PMTILES_URL` | — | The `/staticmap` PMTiles source (local path or `http(s)://` URL). **Required** for `/staticmap`. Fixed server-side; clients cannot choose the source. |
-| `PMTILES_ALIASES` | — | Comma/newline-separated `alias=source` pairs mapping each `/tiles` name to a full source (path or `http(s)://` URL). This is the only way to serve `/tiles` archives — a name with no alias is `404`. e.g. `planet=https://build.protomaps.com/20260702.pmtiles` serves `/tiles/planet/...`. |
+| `PMTILES_ALIASES` | — | Comma/newline-separated `alias=source` pairs mapping each `/tiles` name to a backend `http(s)://` PMTiles URL (local disk paths are rejected). This is the only way to serve `/tiles` archives — a name with no alias is `404`. e.g. `planet=https://build.protomaps.com/20260702.pmtiles` serves `/tiles/planet/...`. |
 | `PORT` | `3000` | Port to listen on. |
 | `RUST_LOG` | `info` | Log/trace filter (e.g. `info,tiler=debug`). |
 | `LOG_FORMAT` | `json` | Log output format: `json` (default, one object per line), `text`/`plain`, or `pretty`. |

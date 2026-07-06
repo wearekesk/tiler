@@ -93,6 +93,11 @@ async fn main() -> std::io::Result<()> {
     // Load the system font database now so the first render doesn't pay for it.
     render::warm_fontdb();
 
+    // Parse `PMTILES_ALIASES` at startup so any invalid entries (e.g. non-URL
+    // sources) are reported now rather than on the first `/tiles` request.
+    let aliases = config::pmtiles_aliases();
+    tracing::info!(count = aliases.len(), "loaded /tiles aliases");
+
     // CORS: allow any origin by default, or restrict to a comma-separated
     // `ALLOWED_ORIGINS` list (`*` also means any).
     let cors = match config::allowed_origins() {

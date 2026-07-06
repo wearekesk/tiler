@@ -34,11 +34,12 @@ env_str!(
 );
 
 /// Parsed alias map from `PMTILES_ALIASES`, mapping a friendly archive name to a
-/// full PMTiles source (local path or `http(s)://` URL). Entries are separated
-/// by commas or newlines, each `alias=source`. This is the sole source of
-/// `/tiles` archives: a name must match an alias to be served, e.g.
-/// `planet=https://host/20260702.pmtiles` makes `/tiles/planet/...` resolve to
-/// that archive.
+/// backend `http(s)://` PMTiles source. Entries are separated by commas or
+/// newlines, each `alias=source`. This is the sole source of `/tiles` archives:
+/// a name must match an alias to be served, e.g. `planet=https://host/x.pmtiles`
+/// makes `/tiles/planet/...` resolve to that archive. Sources must be remote
+/// URLs — a local disk path is a configuration error and is dropped (with a
+/// warning). Reads `PMTILES_ALIASES` once, on first use.
 pub fn pmtiles_aliases() -> &'static HashMap<String, String> {
     static C: OnceLock<HashMap<String, String>> = OnceLock::new();
     C.get_or_init(|| parse_aliases(std::env::var("PMTILES_ALIASES").ok().as_deref()))
@@ -52,12 +53,24 @@ fn parse_aliases(raw: Option<&str>) -> HashMap<String, String> {
     for entry in raw.split(['\n', ',']) {
         // Split on the first `=` only, so a source value may itself contain `=`
         // (e.g. a URL with a query string).
-        if let Some((alias, target)) = entry.split_once('=') {
-            let (alias, target) = (alias.trim(), target.trim());
-            if !alias.is_empty() && !target.is_empty() {
-                map.insert(alias.to_string(), target.to_string());
-            }
+        let Some((alias, target)) = entry.split_once('=') else {
+            continue;
+        };
+        let (alias, target) = (alias.trim(), target.trim());
+        if alias.is_empty() || target.is_empty() {
+            continue;
         }
+        // `/tiles` archives are served only from a backend URL; a local disk
+        // path is rejected so a misconfigured path can't be silently opened.
+        if !(target.starts_with("http://") || target.starts_with("https://")) {
+            tracing::warn!(
+                alias,
+                url = target,
+                "ignoring PMTILES_ALIASES entry: source must be an http(s):// URL"
+            );
+            continue;
+        }
+        map.insert(alias.to_string(), target.to_string());
     }
     map
 }
@@ -78,9 +91,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_comma_and_newline_separated_entries() {
+    fn parses_comma_and_newline_separated_url_entries() {
         let map = parse_aliases(Some(
-            "planet = https://build.protomaps.com/20260702.pmtiles ,\n basemap=/data/basemap.pmtiles",
+            "planet = https://build.protomaps.com/20260702.pmtiles ,\n basemap=http://host/basemap.pmtiles",
         ));
         assert_eq!(
             map.get("planet").map(String::as_str),
@@ -88,7 +101,7 @@ mod tests {
         );
         assert_eq!(
             map.get("basemap").map(String::as_str),
-            Some("/data/basemap.pmtiles")
+            Some("http://host/basemap.pmtiles")
         );
     }
 
@@ -99,6 +112,16 @@ mod tests {
             map.get("q").map(String::as_str),
             Some("https://h/a.pmtiles?k=v")
         );
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn rejects_non_url_sources() {
+        let map =
+            parse_aliases(Some("disk=/data/firenze.pmtiles,rel=firenze.pmtiles,ok=https://h/a.pmtiles"));
+        assert_eq!(map.get("ok").map(String::as_str), Some("https://h/a.pmtiles"));
+        assert!(map.get("disk").is_none());
+        assert!(map.get("rel").is_none());
         assert_eq!(map.len(), 1);
     }
 }
