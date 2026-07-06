@@ -103,10 +103,25 @@ fn starts_new_alias(frag: &str, pending: Option<&str>) -> bool {
     }
     match pending {
         None => true,
-        Some(pending) => {
-            val.starts_with("http://") || val.starts_with("https://") || !pending.contains('?')
-        }
+        // This fragment came after a comma while an entry is pending. Treat it
+        // as a new entry when its value looks like a source — a URL, or a
+        // local-path-shaped value we still want to recognize so `insert_alias`
+        // can reject it rather than folding it into the previous URL — or when
+        // the pending value has no `?` (so its comma can't be a query separator
+        // we'd need to fold, e.g. `?layers=roads,format=png`).
+        Some(pending) => looks_like_source(val) || !pending.contains('?'),
     }
+}
+
+/// Whether a value looks like a PMTiles source (a remote URL or a local path),
+/// as opposed to a URL query-parameter fragment. Used to decide whether a
+/// comma-separated fragment starts a new alias entry.
+fn looks_like_source(val: &str) -> bool {
+    val.starts_with("http://")
+        || val.starts_with("https://")
+        || val.starts_with('/')
+        || val.starts_with('.')
+        || val.ends_with(".pmtiles")
 }
 
 /// Parses a single `alias=source` entry and inserts it, if valid.
@@ -233,6 +248,22 @@ mod tests {
         assert_eq!(
             map.get("planet").map(String::as_str),
             Some("https://h/p.pmtiles")
+        );
+        assert!(map.get("disk").is_none());
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn non_url_alias_after_query_url_on_same_line_is_dropped_not_folded() {
+        // Even when the valid URL carries a query string (so it contains `?`), a
+        // following non-URL entry must be recognized and rejected, not folded
+        // into the query string.
+        let map = parse_aliases(Some(
+            "planet=https://h/p.pmtiles?token=123,disk=/data/firenze.pmtiles",
+        ));
+        assert_eq!(
+            map.get("planet").map(String::as_str),
+            Some("https://h/p.pmtiles?token=123")
         );
         assert!(map.get("disk").is_none());
         assert_eq!(map.len(), 1);
