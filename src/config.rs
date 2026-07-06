@@ -120,7 +120,7 @@ mod tests {
             map.get("ok").map(String::as_str),
             Some("https://h/a.pmtiles")
         );
-        assert!(map.get("disk").is_none());
+        assert!(!map.contains_key("disk"));
         assert_eq!(map.len(), 1);
     }
 }
