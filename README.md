@@ -78,9 +78,10 @@ startup):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PMTILES_URL` | — | The `/staticmap` PMTiles source (local path or `http(s)://` URL). **Required** for `/staticmap`. Fixed server-side; clients cannot choose the source. |
-| `PMTILES_PATH` | `{name}.pmtiles` | `/tiles` archive-name template; `{name}` from the request path is substituted. |
+| `PMTILES_ALIASES` | — | Comma/newline-separated `alias=source` pairs mapping each `/tiles` name to a backend `http(s)://` PMTiles URL (local disk paths are rejected). This is the only way to serve `/tiles` archives — a name with no alias is `404`. e.g. `planet=https://build.protomaps.com/20260702.pmtiles` serves `/tiles/planet/...`. |
 | `PORT` | `3000` | Port to listen on. |
 | `RUST_LOG` | `info` | Log/trace filter (e.g. `info,tiler=debug`). |
+| `LOG_FORMAT` | `json` | Log output format: `json` (default, one object per line), `text`/`plain`, or `pretty`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | When set, spans are exported to this OTLP/gRPC collector (e.g. `http://localhost:4317`). |
 | `ALLOWED_ORIGINS` | any | CORS: comma-separated allowed origins, or `*`/unset for any. |
 | `TILES_CACHE_CONTROL` | `public, max-age=86400` | `Cache-Control` for `/tiles` responses. |
@@ -116,9 +117,9 @@ A raw PMTiles tile server is also mounted, serving whatever the archives contain
 | `GET /tiles/{name}/{z}/{x}/{y}.{ext}` | A single tile. `name` may be nested (contain `/`). |
 | `GET /tiles/{name}.json` | The archive's TileJSON. |
 
-`name` is resolved to a source via `PMTILES_PATH`. The extension must match the
-archive's tile type (else `400`); out-of-range zoom is `404`; a tile absent from
-the archive is `204`.
+`name` is resolved to a source via `PMTILES_ALIASES` (an unaliased name is
+`404`). The extension must match the archive's tile type (else `400`);
+out-of-range zoom is `404`; a tile absent from the archive is `204`.
 
 ### Examples
 

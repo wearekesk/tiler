@@ -6,8 +6,10 @@
 //! `GET /tiles/{name}.json` — the archive's TileJSON.
 //!
 //! `name` may contain `/` (nested archives). It is resolved to a PMTiles source
-//! via the `PMTILES_PATH` template (`{name}` is substituted; default
-//! `{name}.pmtiles`). Path traversal (`..`) and other unsafe names are rejected.
+//! via a matching `PMTILES_ALIASES` entry; a name with no alias is not found.
+//! Path traversal (`..`) and other unsafe names are rejected.
+
+use std::borrow::Cow;
 
 use poem::http::{header, Method, StatusCode};
 use poem::{handler, Body, Request, Response};
@@ -16,12 +18,33 @@ use crate::config;
 use crate::tiles::{get_source, tile_content_type, tile_extension};
 use pmtiles::TileType;
 
-/// Resolves an archive `name` to a PMTiles source string using `PMTILES_PATH`.
-fn resolve_source(name: &str) -> String {
-    match config::pmtiles_path() {
-        Some(tmpl) => tmpl.replace("{name}", name),
-        None => format!("{name}.pmtiles"),
+/// Resolves an archive `name` to a PMTiles source via `PMTILES_ALIASES`, or
+/// `None` if no alias matches. Aliases are the only way to serve an archive, so
+/// an unknown name is simply not found (rather than mapped to some file path).
+fn resolve_source(name: &str) -> Option<&'static str> {
+    config::pmtiles_aliases().get(name).map(String::as_str)
+}
+
+/// Strips potentially-sensitive parts from a source URL so it is safe to log: a
+/// `PMTILES_ALIASES` value may be a presigned or basic-auth URL carrying
+/// credentials in its userinfo or query string. Keeps the scheme, host, and
+/// path for diagnostics; drops `user:pass@` userinfo and the `?query`/`#frag`.
+fn redact_source(source: &str) -> Cow<'_, str> {
+    // Drop query and fragment (either may carry a token/signature).
+    let base = source.split_once(['?', '#']).map_or(source, |(b, _)| b);
+
+    // Redact `userinfo@` in the authority (the part before the first path `/`),
+    // so a `@` later in the path isn't mistaken for userinfo.
+    if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = match rest.split_once('/') {
+            Some((a, p)) => (a, format!("/{p}")),
+            None => (rest, String::new()),
+        };
+        if let Some((_userinfo, host)) = authority.split_once('@') {
+            return Cow::Owned(format!("{scheme}://<redacted>@{host}{path}"));
+        }
     }
+    Cow::Borrowed(base)
 }
 
 /// Rejects names that could escape the intended archive space (path traversal)
@@ -96,6 +119,18 @@ fn text(status: StatusCode, msg: &str) -> Response {
         .body(msg.to_string())
 }
 
+/// Marks a response as explicitly non-cacheable. Used for transient or
+/// config-dependent 404s (an unopenable source, or a name with no alias yet) so
+/// a browser, CDN, or proxy doesn't cache the failure — otherwise a heuristic
+/// cache could hold a 404 that a fixed config or recovered upstream would clear.
+fn no_cache(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    resp
+}
+
 /// Finalizes a response with the tile cache-control header. (CORS is handled by
 /// the `Cors` middleware at the app level.)
 fn finish(mut resp: Response) -> Response {
@@ -124,9 +159,29 @@ pub async fn serve(req: &Request) -> Response {
         return text(StatusCode::NOT_FOUND, "Invalid URL");
     };
 
-    let source = match get_source(&resolve_source(&parsed.name)).await {
+    // No alias for this name: nothing to serve. This is an ordinary "not found",
+    // not an error worth logging. Return it as explicitly non-cacheable — an
+    // operator adding the alias and restarting must not be defeated by a cached
+    // 404.
+    let Some(resolved) = resolve_source(&parsed.name) else {
+        return no_cache(text(StatusCode::NOT_FOUND, "Unknown archive"));
+    };
+    let source = match get_source(resolved).await {
         Ok(s) => s,
-        Err(_) => return finish(text(StatusCode::NOT_FOUND, "Archive not found")),
+        // Opening can fail for reasons that are *not* "the name is wrong":
+        // a TLS/network error reaching a remote archive, an upstream 5xx, or a
+        // timeout. The client still gets a generic 404, but we log the real
+        // cause (with the resolved source) so operators can tell these apart
+        // instead of guessing at an opaque "Archive not found". Marked
+        // non-cacheable: a transient failure must not be cached.
+        Err(e) => {
+            tracing::warn!(
+                source = %redact_source(resolved),
+                error = %format!("{e:#}"),
+                "failed to open PMTiles source"
+            );
+            return no_cache(text(StatusCode::NOT_FOUND, "Archive not found"));
+        }
     };
     let (tile_type, min_zoom, max_zoom) = source.header_info();
 
@@ -224,5 +279,47 @@ pub async fn serve(req: &Request) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("failed to read tile: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_source;
+
+    #[test]
+    fn plain_url_is_unchanged() {
+        assert_eq!(
+            redact_source("https://build.protomaps.com/20260702.pmtiles"),
+            "https://build.protomaps.com/20260702.pmtiles"
+        );
+    }
+
+    #[test]
+    fn drops_query_and_fragment() {
+        assert_eq!(
+            redact_source("https://h/a.pmtiles?X-Amz-Signature=secret&k=v#frag"),
+            "https://h/a.pmtiles"
+        );
+    }
+
+    #[test]
+    fn redacts_userinfo_but_keeps_host_and_path() {
+        assert_eq!(
+            redact_source("https://user:pass@h/dir/a.pmtiles"),
+            "https://<redacted>@h/dir/a.pmtiles"
+        );
+        // An `@` in the path (after the authority) must not be treated as userinfo.
+        assert_eq!(
+            redact_source("https://h/a@b.pmtiles"),
+            "https://h/a@b.pmtiles"
+        );
+    }
+
+    #[test]
+    fn redacts_userinfo_and_query_together() {
+        assert_eq!(
+            redact_source("https://user:pass@h/a.pmtiles?token=secret"),
+            "https://<redacted>@h/a.pmtiles"
+        );
     }
 }
