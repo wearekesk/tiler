@@ -1,13 +1,21 @@
 name: Release
 
-# Build and publish a multi-arch container image to GHCR whenever a semver tag
-# is pushed (e.g. v1.2.3), or a GitHub release is published.
+# Build and publish a multi-arch container image to GHCR when a semver tag is
+# pushed (e.g. v1.2.3). A pushed tag is the single source of truth: both
+# `gh release create` and the GitHub Releases UI push the tag, so this fires
+# exactly once per release. We intentionally do NOT also trigger on
+# `release: published` — that fired a second, duplicate build when a release was
+# created from a new tag (the tag push and the publish are two separate events).
 on:
   push:
     tags: ["v*.*.*"]
-  release:
-    types: [published]
   workflow_dispatch:
+
+# Never run two builds for the same ref at once (e.g. a re-pushed tag). Queue
+# rather than cancel, so an in-flight publish is always allowed to finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
