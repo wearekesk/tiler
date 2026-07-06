@@ -9,6 +9,8 @@
 //! via a matching `PMTILES_ALIASES` entry; a name with no alias is not found.
 //! Path traversal (`..`) and other unsafe names are rejected.
 
+use std::borrow::Cow;
+
 use poem::http::{header, Method, StatusCode};
 use poem::{handler, Body, Request, Response};
 
@@ -21,6 +23,28 @@ use pmtiles::TileType;
 /// an unknown name is simply not found (rather than mapped to some file path).
 fn resolve_source(name: &str) -> Option<&'static str> {
     config::pmtiles_aliases().get(name).map(String::as_str)
+}
+
+/// Strips potentially-sensitive parts from a source URL so it is safe to log: a
+/// `PMTILES_ALIASES` value may be a presigned or basic-auth URL carrying
+/// credentials in its userinfo or query string. Keeps the scheme, host, and
+/// path for diagnostics; drops `user:pass@` userinfo and the `?query`/`#frag`.
+fn redact_source(source: &str) -> Cow<'_, str> {
+    // Drop query and fragment (either may carry a token/signature).
+    let base = source.split_once(['?', '#']).map_or(source, |(b, _)| b);
+
+    // Redact `userinfo@` in the authority (the part before the first path `/`),
+    // so a `@` later in the path isn't mistaken for userinfo.
+    if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = match rest.split_once('/') {
+            Some((a, p)) => (a, format!("/{p}")),
+            None => (rest, String::new()),
+        };
+        if let Some((_userinfo, host)) = authority.split_once('@') {
+            return Cow::Owned(format!("{scheme}://<redacted>@{host}{path}"));
+        }
+    }
+    Cow::Borrowed(base)
 }
 
 /// Rejects names that could escape the intended archive space (path traversal)
@@ -140,7 +164,7 @@ pub async fn serve(req: &Request) -> Response {
         // here either: a transient failure must not be cached for a day.
         Err(e) => {
             tracing::warn!(
-                source = %resolved,
+                source = %redact_source(resolved),
                 error = %format!("{e:#}"),
                 "failed to open PMTiles source"
             );
@@ -243,5 +267,47 @@ pub async fn serve(req: &Request) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("failed to read tile: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_source;
+
+    #[test]
+    fn plain_url_is_unchanged() {
+        assert_eq!(
+            redact_source("https://build.protomaps.com/20260702.pmtiles"),
+            "https://build.protomaps.com/20260702.pmtiles"
+        );
+    }
+
+    #[test]
+    fn drops_query_and_fragment() {
+        assert_eq!(
+            redact_source("https://h/a.pmtiles?X-Amz-Signature=secret&k=v#frag"),
+            "https://h/a.pmtiles"
+        );
+    }
+
+    #[test]
+    fn redacts_userinfo_but_keeps_host_and_path() {
+        assert_eq!(
+            redact_source("https://user:pass@h/dir/a.pmtiles"),
+            "https://<redacted>@h/dir/a.pmtiles"
+        );
+        // An `@` in the path (after the authority) must not be treated as userinfo.
+        assert_eq!(
+            redact_source("https://h/a@b.pmtiles"),
+            "https://h/a@b.pmtiles"
+        );
+    }
+
+    #[test]
+    fn redacts_userinfo_and_query_together() {
+        assert_eq!(
+            redact_source("https://user:pass@h/a.pmtiles?token=secret"),
+            "https://<redacted>@h/a.pmtiles"
+        );
     }
 }
