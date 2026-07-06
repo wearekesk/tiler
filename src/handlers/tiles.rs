@@ -6,8 +6,8 @@
 //! `GET /tiles/{name}.json` — the archive's TileJSON.
 //!
 //! `name` may contain `/` (nested archives). It is resolved to a PMTiles source
-//! via the `PMTILES_PATH` template (`{name}` is substituted; default
-//! `{name}.pmtiles`). Path traversal (`..`) and other unsafe names are rejected.
+//! via a matching `PMTILES_ALIASES` entry; a name with no alias is not found.
+//! Path traversal (`..`) and other unsafe names are rejected.
 
 use poem::http::{header, Method, StatusCode};
 use poem::{handler, Body, Request, Response};
@@ -16,12 +16,11 @@ use crate::config;
 use crate::tiles::{get_source, tile_content_type, tile_extension};
 use pmtiles::TileType;
 
-/// Resolves an archive `name` to a PMTiles source string using `PMTILES_PATH`.
-fn resolve_source(name: &str) -> String {
-    match config::pmtiles_path() {
-        Some(tmpl) => tmpl.replace("{name}", name),
-        None => format!("{name}.pmtiles"),
-    }
+/// Resolves an archive `name` to a PMTiles source via `PMTILES_ALIASES`, or
+/// `None` if no alias matches. Aliases are the only way to serve an archive, so
+/// an unknown name is simply not found (rather than mapped to some file path).
+fn resolve_source(name: &str) -> Option<&'static str> {
+    config::pmtiles_aliases().get(name).map(String::as_str)
 }
 
 /// Rejects names that could escape the intended archive space (path traversal)
@@ -124,9 +123,26 @@ pub async fn serve(req: &Request) -> Response {
         return text(StatusCode::NOT_FOUND, "Invalid URL");
     };
 
-    let source = match get_source(&resolve_source(&parsed.name)).await {
+    // No alias for this name: nothing to serve. This is an ordinary "not found",
+    // not an error worth logging.
+    let Some(resolved) = resolve_source(&parsed.name) else {
+        return finish(text(StatusCode::NOT_FOUND, "Unknown archive"));
+    };
+    let source = match get_source(resolved).await {
         Ok(s) => s,
-        Err(_) => return finish(text(StatusCode::NOT_FOUND, "Archive not found")),
+        // Opening can fail for reasons that are *not* "the name is wrong":
+        // a TLS/network error reaching a remote archive, an upstream 5xx, or a
+        // timeout. The client still gets a generic 404, but we log the real
+        // cause (with the resolved source) so operators can tell these apart
+        // instead of guessing at an opaque "Archive not found".
+        Err(e) => {
+            tracing::warn!(
+                source = %resolved,
+                error = %format!("{e:#}"),
+                "failed to open PMTiles source"
+            );
+            return finish(text(StatusCode::NOT_FOUND, "Archive not found"));
+        }
     };
     let (tile_type, min_zoom, max_zoom) = source.header_info();
 

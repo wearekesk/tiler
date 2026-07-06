@@ -4,8 +4,8 @@
 //! - `GET /tiles/...` — raw PMTiles tiles + TileJSON (see [`handlers::tiles`]).
 //!
 //! Configured via the environment (a `.env` file is loaded at startup):
-//! `PMTILES_URL` (staticmap source), `PMTILES_PATH` (tile-server archive name
-//! template), `PORT`, `RUST_LOG`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+//! `PMTILES_URL` (staticmap source), `PMTILES_ALIASES` (named `/tiles` sources),
+//! `PORT`, `RUST_LOG`, `LOG_FORMAT`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
 //! `ALLOWED_ORIGINS`, `TILES_CACHE_CONTROL`, `PUBLIC_HOSTNAME`.
 
 mod config;
@@ -63,9 +63,21 @@ fn init_telemetry() -> Option<SdkTracerProvider> {
         tracing_opentelemetry::layer().with_tracer(p.tracer(SERVICE_NAME))
     });
 
+    // Logs are structured JSON by default (one object per line — friendly to
+    // log collectors). Set `LOG_FORMAT=text` (or `pretty`) for human-readable
+    // output during local development.
+    let fmt_layer = match std::env::var("LOG_FORMAT").as_deref() {
+        Ok("text") | Ok("plain") => tracing_subscriber::fmt::layer().boxed(),
+        Ok("pretty") => tracing_subscriber::fmt::layer().pretty().boxed(),
+        _ => tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .boxed(),
+    };
+
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(fmt_layer)
         .with(otel_layer)
         .init();
 

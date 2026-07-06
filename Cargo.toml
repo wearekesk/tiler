@@ -28,7 +28,7 @@ jpeg-encoder = "0.7"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
